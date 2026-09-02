@@ -1,0 +1,29 @@
+{
+  "train": [
+    "django__django-16429",
+    "sphinx-doc__sphinx-8621",
+    "sympy__sympy-23534",
+    "scikit-learn__scikit-learn-14141",
+    "pylint-dev__pylint-4970",
+    "astropy__astropy-7166",
+    "matplotlib__matplotlib-20676",
+    "pallets__flask-5014",
+    "psf__requests-1142",
+    "pydata__xarray-4629"
+  ],
+  "eval": [
+    "django__django-13406",
+    "sphinx-doc__sphinx-9230",
+    "sympy__sympy-14711",
+    "scikit-learn__scikit-learn-13439",
+    "pylint-dev__pylint-6903",
+    "pytest-dev__pytest-5809"
+  ],
+  "criteria": {
+    "difficulty": "<15 min fix",
+    "single_file_patch": true,
+    "max_f2p": 5,
+    "max_p2p": 60,
+    "max_per_repo": 3
+  }
+}

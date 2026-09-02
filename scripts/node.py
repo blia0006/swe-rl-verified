@@ -147,6 +147,83 @@ def cmd_run(args) -> int:
     return code
 
 
+def cmd_put(args) -> int:
+    """把本地文件投放到节点（内容走 base64，避免 SCP/公网入站需求）。
+
+    ⚠️ 云助手 `RunCommand` 的 `Content` 字段上限为 **65535 字节**（实测报
+    `InvalidParameterValue.TooLong`），且内容本身还要 base64 膨胀 4/3 倍。
+    因此大文件按块切分、逐块追加，最后用 md5 校验整体一致性。
+
+    仍不适合投放模型权重/镜像这类大件（那些走 ModelScope / TCR / COS）；
+    本命令定位是代码与数据文件（几十 KB ~ 数 MB）。
+    """
+    import hashlib
+
+    src = Path(args.local).expanduser()
+    if not src.is_file():
+        sys.exit(f"[x] 本地文件不存在：{src}")
+    raw = src.read_bytes()
+    remote = args.remote or f"/data/swe-rl/{src.name}"
+    local_md5 = hashlib.md5(raw).hexdigest()
+
+    # 每块原始字节数：base64 后膨胀 4/3，外层还要包 heredoc；云助手 Content 上限
+    # 65535 字节，取 24KB 原始数据 → 约 32KB base64，留足余量
+    chunk = 24 * 1024
+    blocks = [raw[i : i + chunk] for i in range(0, len(raw), chunk)] or [b""]
+    rq = json.dumps(remote)
+
+    for idx, blk in enumerate(blocks):
+        # base64 内容经 heredoc 送入，避免作为命令行参数触发 shell 参数长度上限
+        # （曾用 printf '%s' <base64> 导致 Content 超限报 TooLong）
+        payload = base64.b64encode(blk).decode()
+        redirect = ">" if idx == 0 else ">>"
+        script = (
+            f"mkdir -p $(dirname {rq}) && "
+            f"base64 -d {redirect} {rq} <<'__B64_EOF__'\n{payload}\n__B64_EOF__"
+        )
+        code, out = remote_exec(script, timeout=180, quiet=True)
+        if code != 0:
+            print(f"[x] 第 {idx + 1}/{len(blocks)} 块写入失败：{out[:300]}", file=sys.stderr)
+            return 1
+        if len(blocks) > 1:
+            print(f"  投放中 {idx + 1}/{len(blocks)} 块", end="\r", file=sys.stderr)
+
+    code, out = remote_exec(f"wc -c < {rq}; md5sum {rq}", timeout=120, quiet=True)
+    if local_md5 in out:
+        print(f"[ok] 已投放 {remote}（{len(raw)} 字节，{len(blocks)} 块，md5 一致）")
+        return 0
+    print(f"[!] md5 校验失败：本地={local_md5}\n远端输出：{out[:300]}", file=sys.stderr)
+    return 1
+
+
+def cmd_nohup(args) -> int:
+    """在节点后台启动长任务，日志落宿主机文件，立即返回。
+
+    训练/下载这类跑几十分钟的任务必须这样起 —— 云助手单次调用有超时上限，
+    前台跑会被截断。之后用 `node.py watch <log>` 跟踪。
+
+    ⚠️ 关键：Python 输出重定向到文件时默认是**全缓冲**（4~8KB 才落盘），
+    会导致 `watch` 长时间看不到任何输出、误判任务卡死。
+    因此统一注入 `PYTHONUNBUFFERED=1`，并优先用 `stdbuf` 关掉 libc 层缓冲。
+    """
+    log = args.log
+    prefix = "PYTHONUNBUFFERED=1 "
+    cmd = args.command
+    if not args.no_unbuffer:
+        # stdbuf 不一定存在（busybox 等），存在才用，避免 command not found
+        cmd = f"if command -v stdbuf >/dev/null 2>&1; then stdbuf -oL -eL {cmd}; else {cmd}; fi"
+    script = (
+        f"mkdir -p $(dirname {json.dumps(log)}) && cd {json.dumps(args.workdir)} && "
+        f"{prefix}nohup sh -c {json.dumps(cmd)} > {json.dumps(log)} 2>&1 & "
+        f"echo started pid=$!; sleep 3; echo '--- 日志前几行 ---'; "
+        f"head -5 {json.dumps(log)} 2>/dev/null"
+    )
+    code, out = remote_exec(script, timeout=120)
+    print(out.strip())
+    print(f"\n[提示] 跟踪日志：python3 scripts/node.py watch {log}")
+    return code
+
+
 def cmd_tail(args) -> int:
     script = f"tail -n {int(args.lines)} -- {json.dumps(args.path)}"
     code, out = remote_exec(script, timeout=120)
@@ -240,6 +317,22 @@ def main() -> int:
     p.add_argument("path")
     p.add_argument("-n", "--lines", default=50)
     p.set_defaults(func=cmd_tail)
+
+    p = sub.add_parser("put", help="投放本地文件到节点（≤512KB，走 base64）")
+    p.add_argument("local")
+    p.add_argument("remote", nargs="?", default="")
+    p.set_defaults(func=cmd_put)
+
+    p = sub.add_parser("nohup", help="在节点后台起长任务，日志落文件后立即返回")
+    p.add_argument("command")
+    p.add_argument("--log", required=True, help="宿主机日志路径")
+    p.add_argument("--workdir", default="/data/swe-rl")
+    p.add_argument(
+        "--no-unbuffer",
+        action="store_true",
+        help="不注入行缓冲（默认注入，否则日志要攒够几 KB 才落盘，看不到进度）",
+    )
+    p.set_defaults(func=cmd_nohup)
 
     p = sub.add_parser("watch", help="轮询跟踪远端日志（近似 tail -f）")
     p.add_argument("path")
