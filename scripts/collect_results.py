@@ -56,9 +56,16 @@ def fetch():
     DOCS.mkdir(parents=True, exist_ok=True)
     print("从节点拉取训练数据…")
 
+    # 按「含 step 数最多」挑日志，而非按修改时间 ——
+    # 训练脚本每次用新时间戳建文件，失败的空日志可能反而更新，
+    # 曾因此只取到 11 步（实际最新一轮跑了 31 步）
+    # ⚠️ 不能直接回传原始 step 日志：verl 每步打印一整行数百个指标，
+    # 31 步就有 15 万字符，超过云助手单次输出上限而被静默截断
+    # （实测只拿回 11 步，误以为训练提前结束）。
+    # 改为**在节点侧先提取出需要的几个字段**，只回传精简 CSV。
     steps_raw = node_run(
-        'LOG=$(ls -t /data/swe-rl/logs/train_2*.log 2>/dev/null | head -1); '
-        '[ -n "$LOG" ] && grep -a "critic/score/mean" "$LOG"'
+        'LOG=$(bash /data/swe-rl/scripts/pick_train_log.sh); '
+        '[ -n "$LOG" ] && python3 /data/swe-rl/scripts/extract_steps.py "$LOG"'
     )
     (DOCS / "_steps.raw").write_text(steps_raw, encoding="utf-8")
 
@@ -83,20 +90,38 @@ def fetch():
 
 
 def parse_steps(text):
-    import re
-
-    rx = re.compile(r"([\w/]+):\s*([-+0-9.eE]+)")
+    """解析 extract_steps.py 产出的精简 CSV。"""
+    lines = [l for l in text.splitlines() if l.strip()]
+    if not lines:
+        return []
+    # 找到表头行（可能前面混有云助手的杂讯）
+    hi = next((i for i, l in enumerate(lines) if l.startswith("step,")), None)
+    if hi is None:
+        return []
+    cols = lines[hi].split(",")
+    key = {
+        "step": "step",
+        "score_mean": "critic/score/mean",
+        "score_max": "critic/score/max",
+        "grad_norm": "actor/grad_norm",
+        "entropy": "actor/entropy",
+        "pg_loss": "actor/pg_loss",
+        "resp_len": "response_length/mean",
+    }
     out = []
-    for line in text.splitlines():
-        if "critic/score/mean" not in line:
+    for line in lines[hi + 1:]:
+        parts = line.split(",")
+        if len(parts) != len(cols):
             continue
         d = {}
-        for k, v in rx.findall(line):
+        for c, v in zip(cols, parts):
+            if not v:
+                continue
             try:
-                d[k] = float(v)
+                d[key.get(c, c)] = float(v)
             except ValueError:
                 pass
-        if "step" in d:
+        if "step" in d and "critic/score/mean" in d:
             out.append(d)
     return out
 

@@ -71,3 +71,7 @@ Thumbs.db
 data/criteria_check.json
 data/image_map.json
 data/sandbox_image_map.json
+
+# 结果归档的中间产物（由 collect_results.py 从节点拉取后生成正式文件）
+docs/_*.raw
+docs/train_metrics.csv

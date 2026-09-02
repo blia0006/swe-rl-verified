@@ -58,9 +58,22 @@ export SANDBOX_IMAGE_TAG="${SANDBOX_IMAGE_TAG:-sbx}"
 export PYTHONPATH="$WORKDIR:$WORKDIR/pylibs:${PYTHONPATH:-}"
 
 # ---------- 超参 ----------
-ROLLOUT_N="${ROLLOUT_N:-8}"                 # GRPO 组大小；组内比较产生 advantage
-TRAIN_BATCH="${TRAIN_BATCH:-2}"             # 上一轮=1 使单步 reward 主要由"抽到哪题"决定
-MINI_BATCH="${MINI_BATCH:-2}"
+# ⚠️ 已归档的 31 step 实测结果（README §7.3）跑的是**旧配置**：
+#     ROLLOUT_N=8, TRAIN_BATCH=2, MINI_BATCH=2  → 63 行数据只出 31 step
+#   下方为据其诊断结论调整后的值，尚未执行。要复现归档结果请用：
+#     ROLLOUT_N=8 TRAIN_BATCH=2 MINI_BATCH=2 bash scripts/run_grpo_training.sh
+
+# GRPO 组大小。首轮 31 步实测：14/31 步组内 8 个采样**全部得 0 分**，
+# 组内无差异 → advantage 恒 0 → 那些步没有任何梯度。
+# 加到 16 可显著提高"至少一个采样得分"的概率，直接改善有效步占比。
+ROLLOUT_N="${ROLLOUT_N:-16}"
+# 每步题数。=2 时 63 行数据只跑出 31 step（行数被折半），不满足验收的 ≥50 step；
+# 且每步只抽 2 题、题池仅 9 题，抽样方差压过学习信号 ——
+# 首轮实测 reward 前 1/3 (0.0344) > 后 1/3 (0.0163)，
+# 但满分步随机散布在 2,7,9,11,20,25,29，是抽样噪声而非真实下降趋势。
+# 改回 1：step 数 = 行数，且靠加大 ROLLOUT_N 保证组内多样性。
+TRAIN_BATCH="${TRAIN_BATCH:-1}"
+MINI_BATCH="${MINI_BATCH:-1}"
 MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-6144}"    # prompt 内嵌文件内容
 MAX_RESP_LEN="${MAX_RESP_LEN:-1024}"        # search/replace 块比整份 diff 短
 LORA_RANK="${LORA_RANK:-32}"                # 3B 比上一轮 1.5B 容量大，rank 相应提高

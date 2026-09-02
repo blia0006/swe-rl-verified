@@ -108,7 +108,10 @@ def moving_avg(values, w):
 def collect():
     """一次性从节点抓齐所有数据（合并成一条命令，减少往返）。"""
     cmd = r"""
-LOG=$(ls -t /data/swe-rl/logs/train_2*.log 2>/dev/null | head -1)
+# 按「含 step 数最多」挑日志，而非按修改时间 ——
+# 训练脚本每次用新时间戳建文件，失败的空日志可能反而更新，
+# 曾因此读到旧文件、误判训练已停止
+LOG=$(bash /data/swe-rl/scripts/pick_train_log.sh)
 echo "###LOGFILE"; echo "$LOG"
 echo "###GPU"
 nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu,temperature.gpu --format=csv,noheader
