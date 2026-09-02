@@ -335,3 +335,76 @@ apply 成功 + 插错位置 + 代码语法坏   → 0.2      ← 实测占 apply
 上一轮 21 题里有 6 题因镜像与数据不匹配被剔除，但属**事后**发现；
 本轮把它作为进入训练前的硬门禁。
 
+
+---
+
+## 2026-09-02（续）· 训练侧全链路打通：search/replace 表示 + reward=1.0 实测
+
+### 沙箱镜像问题的最终解法
+
+官方 SWE-bench 镜像无法直接作为 AGS 沙箱工具使用，连踩四个坑：
+
+| # | 现象 | 真因与解法 |
+|---|---|---|
+| 1 | `ContainerStart: init command path error` | 官方镜像缺 AGS 的 envd agent。用 **docker build 多阶段 COPY** 从现役可用镜像搬运 envd + s6（构建机有 docker；节点侧的 `ctr commit` 不存在、手改 OCI 清单被平台拒） |
+| 2 | `ImagePrepare: Internal server error` | **实为镜像预热未完成，等约 4 分钟即可**。此报错极具误导性，曾据此误判为清单格式问题、白改两版方案。已固化为 `clients/sandbox.py::start_instance_with_warmup` |
+| 3 | `AuthenticationException: unknown user 'user'` | 官方镜像无 `user` 账号，e2b 默认以该身份写文件 → 必须显式 `user="root"` |
+| 4 | `future feature annotations is not defined` | testbed conda 环境是 **py3.6**（随题目依赖而定）。判据脚本改用 `/usr/bin/python3`（3.10）执行、内部调 testbed python 跑 pytest；**必须写绝对路径**，否则 PATH 里 conda 在前会解析错解释器 |
+
+### 判据链路验证（训练前的硬门禁）
+
+`experiments/verify_criteria.py`，三场景全过：
+
+```
+① 空解      F2P=0/1  P2P=2/2               ✓  题目有效（修复前确实失败）
+② golden    F2P=1/1  P2P=2/2  reward=1.000 ✓  满分可达
+③ 垃圾patch apply_failed                    ✓  防作弊正常
+```
+
+**② 是最关键的一条** —— 它证明「满分拿得到」。上一轮 55 步中仅 1 步分数 >0.2
+（即几乎从未真正修对过题），本轮把这一点作为进入训练前的必过门禁。
+
+### 任务表示改为 search/replace（针对上一轮最大瓶颈）
+
+上一轮 440 次采样的失败分布：`corrupt patch` **227** / `without header` 44 /
+`does not apply` 10，strict 可应用仅 **8/440 = 1.8%**。
+根因是 unified diff 要求模型手算 hunk header（`@@ -起始行,行数 +起始行,行数 @@`），
+这对小模型是硬伤 —— 一位算错整个 patch 就废。
+
+`pipeline/edit_format.py` 改为：
+
+```
+### path/to/file.py
+<<<<<<< SEARCH
+    原始代码片段
+=======
+    替换后的代码
+>>>>>>> REPLACE
+```
+
+**完全不需要行号**，靠内容定位；行号由 `difflib` 确定性算出。
+容错覆盖小模型的实际错法（均有自测，8 项全通过）：
+
+| 容错项 | 说明 |
+|---|---|
+| markdown 围栏 | ` ```python ` / ` ``` ` 自动剥离 |
+| 路径幻觉 | 后缀匹配纠正（上一轮实测有丢 `src/` 前缀、凭空加前缀两类） |
+| 缩进偏差 | 去缩进匹配后套用原文缩进 |
+| 行尾空白 | 忽略 |
+| 失败归因 | 区分「没写出块 / 路径不在清单 / SEARCH 未匹配」 |
+
+### 端到端实测（`pipeline/verl_reward_fn.py`）
+
+| 场景 | reward | 耗时 |
+|---|---|---|
+| 正确解（search/replace，无任何行号） | **1.0000** | 31.8s（含冷启动） |
+| 空谈无编辑块 | 0.0000 | 0.0s |
+| 改错内容（格式对、改动无意义） | 0.2000 | **2.8s**（实例复用） |
+| 缓存命中 | 1.0000 | 0.00s |
+
+→ 实例复用后单次判分 **2.8s**，GRPO 每步 8 采样约 **22s**，训练吞吐可接受。
+
+三层降本均已生效：实例池（26s→2.8s）、并发、`(task_id, patch_hash)` 缓存。
+失败归因逐条落 `REWARD_DEBUG_LOG`，可直接做定量分析 ——
+上一轮只记 reward 标量、事后无法区分失败类型的问题不再重演。
+
