@@ -1,0 +1,147 @@
+# TKE GPU 训练 Pod —— 在 TKE GPU 节点上部署 VERL
+# ==============================================
+#
+# 对应课题要求：「在 TKE GPU 节点上部署 VERL，消费 tracing 数据进行 GRPO/PPO 训练」
+#
+# 本文件基于第一轮的 gpu-pod.yaml 改造，修掉三处问题：
+#
+# | # | 原问题 | 本文件的修法 |
+# |---|---|---|
+# | 1 | `/workspace` 无 hostPath 挂载，2.9G 权重 + 22G checkpoint 全在容器可写层，**删 Pod 即全丢** | 挂 hostPath `/data/swe-rl`，Pod 可随意重建 |
+# | 2 | `Service type=LoadBalancer` 申请**公网 CLB**，让沙箱经公网访问推理服务 | 改 `ClusterIP` + VPC 内网直通（沙箱已迁至同 VPC） |
+# | 3 | 硬编码资源上限 cpu=4/mem=19Gi，5090 节点实际有 32 核 / 92GB | 放宽到 8 核 / 32Gi，给 offload 留空间 |
+#
+# 部署（在 GPU 节点上执行，节点位于 VPC 内可直连集群内网 APIServer）：
+#     kubectl apply -f /data/swe-rl/deploy/gpu-pod.yaml
+#     kubectl get pod swe-rl-train -w
+#     kubectl exec -it swe-rl-train -- bash
+#
+# ⚠️ 不要用 TKE 控制台手动粘贴精简 YAML —— 极易漏掉 volumes 段，
+#    而 /dev/shm 挂载一旦缺失，运行期无法补救（详见下方注释）。
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: swe-rl-train
+  labels:
+    app: swe-rl-train
+spec:
+  restartPolicy: Never
+
+  # 固定调度到 5090 节点。集群内可能存在多种 GPU 机型，
+  # 而本项目的全套配置（cu128 / sm_120 / 显存分配）都是按 5090 调的。
+  # 部署前用实际节点内网 IP 替换（见 deploy/apply.sh，会自动注入）
+  nodeSelector:
+    kubernetes.io/hostname: "__GPU_NODE_IP__"
+
+  containers:
+    - name: main
+      # 【必须 cu128 镜像】RTX 5090 是 Blackwell (sm_120)。
+      # CUDA 12.1 系镜像会报 "no kernel image is available for execution on the device"。
+      # verl:vllm011.latest = verl0.6 + cu128 + torch2.8.0 + fa2.7.4，已覆盖 sm_120。
+      image: verlai/verl:vllm011.latest
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "infinity"]
+
+      env:
+        # verl 与 pipeline 代码都从挂载盘读，不打进镜像
+        - name: PYTHONPATH
+          value: "/data/swe-rl:/data/swe-rl/pylibs"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: WORKDIR
+          value: "/data/swe-rl"
+        - name: HF_HOME
+          value: "/data/swe-rl/hf_cache"
+        # 单卡训练无跨卡通信，禁用共享内存通道零性能损失，
+        # 作为 /dev/shm 不足时的兜底（与下方 dshm 挂载双保险）
+        - name: NCCL_SHM_DISABLE
+          value: "1"
+        - name: NCCL_P2P_DISABLE
+          value: "1"
+        - name: TOKENIZERS_PARALLELISM
+          value: "false"
+        - name: VLLM_WORKER_MULTIPROC_METHOD
+          value: "spawn"
+        # 云凭证从 Secret 注入，不写进 YAML（见 deploy/create-secret.sh）
+      envFrom:
+        - secretRef:
+            name: swe-rl-creds
+            optional: true
+
+      resources:
+        requests:
+          nvidia.com/gpu: 1
+          cpu: "6"
+          memory: "24Gi"
+        limits:
+          nvidia.com/gpu: 1
+          # 节点实为 32 核 / 92GB。放宽上限给 FSDP 的 param/optimizer offload
+          # 留出 CPU 内存空间（3B + LoRA 实测 CPU 侧占用约 14GB）
+          cpu: "12"
+          memory: "48Gi"
+
+      volumeMounts:
+        # ── 工作目录：模型权重 / 训练数据 / checkpoint / 日志 ──
+        # 【第一轮的教训】原 Pod 未挂此卷，22G checkpoint 与 2.9G 权重全在
+        # 容器可写层，删 Pod 即全部丢失。落到宿主机后 Pod 变成"可抛弃运行时"。
+        - name: workdir
+          mountPath: /data/swe-rl
+
+        # ── /dev/shm ──
+        # 【不可省略】容器内 /dev/shm 默认仅 64MB，而 NCCL 初始化每个 rank 需申请
+        # 约 31.5MB 共享内存段。若上次训练泄漏了 /dev/shm/nccl-*（`pkill -9` 强杀
+        # Ray worker 即会泄漏），新训练启动就报：
+        #   ncclSystemError: ... /dev/shm/nccl-XXXXXX (size 33030528),
+        #   error: No space left on device (28)
+        # 表现为 FSDP 初始化失败、训练零步崩溃。
+        # 且非 privileged Pod 内 `mount -o remount,size=8G /dev/shm` 会报
+        # write-protected，**运行期无法补救**，只能重建 Pod。
+        - name: dshm
+          mountPath: /dev/shm
+
+  volumes:
+    - name: workdir
+      hostPath:
+        path: /data/swe-rl
+        type: DirectoryOrCreate
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 4Gi
+
+---
+# 推理服务（线 A 用）：沙箱内的 Agent 通过它取 action
+#
+# 【第一轮的问题】原为 `type: LoadBalancer`，会申请**公网 CLB**，
+# 让上海的沙箱经公网访问北京的推理服务 —— 既暴露公网，又跨地域。
+#
+# 【本轮修法】沙箱已迁至与 GPU 同 VPC（ap-beijing / <GPU 节点所在子网>），
+# 改用 **NodePort** —— 沙箱通过节点内网 IP `<GPU_NODE_IP>:30800` 访问，全程不出 VPC。
+#
+# 为什么不用 ClusterIP：ClusterIP 只在集群 Pod 网络内可路由，
+# 沙箱虽在同一 VPC 但不属于该集群，访问不到 ClusterIP。
+# NodePort 绑在节点的内网 IP 上，VPC 内任意主机都能访问 —— 正是我们要的。
+#
+# 为什么不用 LoadBalancer：TKE 的 LoadBalancer 默认申请**公网** CLB
+# （第一轮即如此），会把推理服务暴露到互联网。
+# 若确实需要 CLB，应加注解 `service.kubernetes.io/qcloud-loadbalancer-internal-subnetid`
+# 指定内网子网，但对本场景 NodePort 已足够且更简单。
+#
+# 已实测：沙箱可 TCP 连通 GPU 节点内网 IP，且自身无公网出口。
+apiVersion: v1
+kind: Service
+metadata:
+  name: swe-rl-llm
+  annotations:
+    description: "VERL rollout 推理服务；经节点内网 IP:30800 暴露，仅 VPC 内可达"
+spec:
+  type: NodePort
+  selector:
+    app: swe-rl-train
+  ports:
+    - name: llm
+      port: 8000
+      targetPort: 8000
+      # 固定 NodePort，便于沙箱侧写死 endpoint（默认随机分配不便复现）
+      nodePort: 30800
