@@ -30,7 +30,7 @@ import sys
 from pathlib import Path
 
 WORKDIR = Path(os.environ.get("WORKDIR", "/data/swe-rl"))
-MODEL = Path(os.environ.get("MODEL_PATH", str(WORKDIR / "model" / "Qwen2.5-Coder-7B-Instruct")))
+MODEL = Path(os.environ.get("MODEL_PATH", str(WORKDIR / "model" / "Qwen2.5-Coder-3B-Instruct")))
 
 results = []
 
@@ -147,7 +147,7 @@ def main():
             llm = LLM(
                 model=str(MODEL),
                 dtype="bfloat16",
-                gpu_memory_utilization=float(os.environ.get("GPU_MEM_UTIL", "0.35")),
+                gpu_memory_utilization=float(os.environ.get("GPU_MEM_UTIL", "0.75")),
                 max_model_len=8192,
                 enforce_eager=True,
                 disable_log_stats=True,

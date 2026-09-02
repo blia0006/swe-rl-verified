@@ -13,13 +13,14 @@
 #                                        需约 31.5MB，不设会零步崩溃且运行期无法补救
 #
 # 【改动】针对上一轮 reward 学不动的三处根因：
-#   1. 模型 1.5B → 7B（代码专精），直击"写不出合法 patch"
+#   1. 模型 1.5B → 3B（代码专精；7B 因单卡显存装不下而放弃，见下）
 #   2. 任务表示 unified diff → search/replace（reward function 侧实现，不需算行号）
 #   3. reward 四档细化（pipeline/reward.py），"写歪"与"写对"差 4 倍
 #
-# 【7B 的显存重算】24GB 卡上 7B + LoRA + vLLM 同卡共存：
-#   权重 bf16 15.2GB 太满，因此 gpu_memory_utilization 降到 0.35 给 FSDP 留位；
-#   若仍 OOM，依次降 max_response_length → rollout.n → 换 8bit。
+# 【模型选型的实测修正】原定 7B，但 24GB 单卡跑 hybrid engine 装不下
+#   （依据见下方 GPU_MEM_UTIL 处），改用 **Qwen2.5-Coder-3B-Instruct**：
+#   同为代码专精系列，参数量仍是上一轮 1.5B 的 2 倍。
+#   若 OOM，依次降 max_response_length → rollout.n → gpu_memory_utilization。
 #
 # 用法（GPU 宿主机的容器内）：
 #   bash scripts/run_grpo_training.sh
@@ -29,7 +30,7 @@ set -uo pipefail
 WORKDIR="${WORKDIR:-/data/swe-rl}"
 cd "$WORKDIR"
 
-MODEL_PATH="${MODEL_PATH:-$WORKDIR/model/Qwen2.5-Coder-7B-Instruct}"
+MODEL_PATH="${MODEL_PATH:-$WORKDIR/model/Qwen2.5-Coder-3B-Instruct}"
 TRAIN_FILE="${TRAIN_FILE:-$WORKDIR/data/grpo_train.parquet}"
 CKPT_DIR="${CKPT_DIR:-$WORKDIR/checkpoints}"
 LOG_DIR="${LOG_DIR:-$WORKDIR/logs}"
@@ -54,7 +55,7 @@ export TASKS_FILE="${TASKS_FILE:-$WORKDIR/data/tasks.jsonl}"
 export FILE_CONTENTS_FILE="${FILE_CONTENTS_FILE:-$WORKDIR/data/file_contents.json}"
 export REWARD_DEBUG_LOG="${REWARD_DEBUG_LOG:-$LOG_DIR/reward_debug.jsonl}"
 export SANDBOX_IMAGE_TAG="${SANDBOX_IMAGE_TAG:-sbx}"
-export PYTHONPATH="$WORKDIR:${PYTHONPATH:-}"
+export PYTHONPATH="$WORKDIR:$WORKDIR/pylibs:${PYTHONPATH:-}"
 
 # ---------- 超参 ----------
 ROLLOUT_N="${ROLLOUT_N:-8}"                 # GRPO 组大小；组内比较产生 advantage
@@ -62,10 +63,22 @@ TRAIN_BATCH="${TRAIN_BATCH:-2}"             # 上一轮=1 使单步 reward 主�
 MINI_BATCH="${MINI_BATCH:-2}"
 MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-6144}"    # prompt 内嵌文件内容
 MAX_RESP_LEN="${MAX_RESP_LEN:-1024}"        # search/replace 块比整份 diff 短
-LORA_RANK="${LORA_RANK:-32}"                # 7B 比 1.5B 容量大，rank 相应提高
+LORA_RANK="${LORA_RANK:-32}"                # 3B 比上一轮 1.5B 容量大，rank 相应提高
 LORA_ALPHA="${LORA_ALPHA:-32}"
 LR="${LR:-1e-5}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.35}"        # 7B 权重占得多，给 FSDP actor 留足
+# ⚠️ gpu_memory_utilization 是 vLLM 可用显存的**总**占比（含权重本身），
+# 不是"留给 KV cache 的比例"。且 verl 是 hybrid engine：
+# FSDP actor 先加载、vLLM 后启动，vLLM 只能用**剩余**显存。
+#
+# 【实测结论：7B 在 24GB 单卡上装不下，已放弃】
+#   FSDP actor 即便开了 param_offload，残留仍约 15.8GB（LoRA 参数 +
+#   激活缓冲 + CUDA context）；vLLM 再要 15.2GB 权重 → 合计 31GB > 23.4GB。
+#   三档全部失败：0.35/0.68 → KV cache 为负；0.26 →
+#   "Failed to create unquantized linear weights"（连权重都放不下）。
+#
+# 【3B 的账】权重 6.2GB，FSDP 残留约 7GB，vLLM 预算 0.45×23.4≈10.5GB，
+#   其中权重 6.2GB + KV cache 约 4.3GB，余量充足。
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.45}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-1}"
 SAVE_FREQ="${SAVE_FREQ:-10}"
 TEMPERATURE="${TEMPERATURE:-0.9}"           # 组内必须有方差，否则 advantage 恒 0
@@ -125,6 +138,7 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.temperature="$TEMPERATURE" \
   actor_rollout_ref.rollout.top_p="$TOP_P" \
   actor_rollout_ref.rollout.gpu_memory_utilization="$GPU_MEM_UTIL" \
+  actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
   actor_rollout_ref.rollout.dtype=bfloat16 \
   actor_rollout_ref.rollout.enforce_eager=True \
   actor_rollout_ref.rollout.free_cache_engine=True \
