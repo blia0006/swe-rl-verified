@@ -26,10 +26,17 @@
 5. **训练集 / 评测集严格不重叠**，且各自独立分层。
 
 划分（与验收标准对应）：
-    · 训练集 10 题 → 线 A 采集 10 条 tracing（验收第 1 条要求 ≥10 题）
+    · 训练集 10 题 → 线 A 采集 10 条 tracing，直接对应验收第 1 条「≥10 题」
                      线 B 用它们跑 GRPO
-    · 评测集  8 题 → 训练前后 pass@1 对比，k=8 采样 = 64 个样本
-                     （上一轮 4 题 × k=1 期望成功次数仅 0.07，结论无统计意义）
+    · 评测集 10 题 → 训练前后 pass@1 对比（验收第 6 条），k=8 采样 = 80 个样本
+
+**为什么评测集也要 10 题**：课题只对采集侧规定了「≥10 题」，对评测侧只要求
+「有对比数据」，未给题数。但评测规模直接决定结论能否成立 ——
+上一轮用 4 题 × k=1，而 strict 成功率实测仅 1.8%，期望成功次数 = 4×0.018 = **0.07**，
+结果必然全 0、Welch t 检验完全不显著，等于没有结论。
+样本数 = 题数 × k，10 题 × 8 = 80 个样本，相对标准误比 4 题方案降约 37%。
+镜像体积曾是压缩题量的理由，但节点只是搬运中转站（沙箱从 TCR 拉镜像），
+搬完即 `ctr content prune references` 回收（实测一次回收 18GiB），磁盘不再是约束。
 
 用法：
     python3 pipeline/select_tasks.py                     # 生成 data/tasks.jsonl + split.json
@@ -157,9 +164,15 @@ def stratified_pick(pool: list[dict], n: int, per_repo: int, taken: set[str]) ->
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--train", type=int, default=10, help="训练集题数（验收要求 ≥10）")
-    ap.add_argument("--eval", type=int, default=8, help="评测集题数（保证统计功效）")
-    ap.add_argument("--per-repo", type=int, default=3, help="单个 repo 最多贡献几题")
+    ap.add_argument("--train", type=int, default=10, help="训练集题数（验收第 1 条要求 ≥10）")
+    ap.add_argument("--eval", type=int, default=10, help="评测集题数（决定 pass@1 对比的统计功效）")
+    ap.add_argument(
+        "--per-repo",
+        type=int,
+        default=4,
+        help="单个 repo 最多贡献几题。候选池按 repo 极不均衡（django 54 / 多个 repo 仅 1），"
+        "per-repo=3 时上限恰为 20 题（正好卡满 10+10，无余量），故默认放宽到 4",
+    )
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 

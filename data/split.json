@@ -17,13 +17,17 @@
     "sympy__sympy-14711",
     "scikit-learn__scikit-learn-13439",
     "pylint-dev__pylint-6903",
-    "pytest-dev__pytest-5809"
+    "pytest-dev__pytest-5809",
+    "django__django-14089",
+    "sphinx-doc__sphinx-9591",
+    "sympy__sympy-19637",
+    "scikit-learn__scikit-learn-12585"
   ],
   "criteria": {
     "difficulty": "<15 min fix",
     "single_file_patch": true,
     "max_f2p": 5,
     "max_p2p": 60,
-    "max_per_repo": 3
+    "max_per_repo": 4
   }
 }

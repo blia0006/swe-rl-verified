@@ -62,6 +62,21 @@ def need(key: str) -> str:
     return v
 
 
+def _denoise(text: str) -> str:
+    """滤掉 containerd 的 DEPRECATION 警告。
+
+    这些警告每次调用 ctr 都会打两行，且比真实报错更靠前，
+    截取 `out[-300:]` 时会把真因完全挤掉 —— 实测导致
+    `content digest not found` 这个关键错误一度看不到，误判为网络问题。
+    """
+    keep = [
+        ln
+        for ln in text.splitlines()
+        if "DEPRECATION" not in ln and "is deprecated since containerd" not in ln
+    ]
+    return "\n".join(keep).strip()
+
+
 def sh(
     cmd: list[str],
     timeout: int = 3600,
@@ -80,7 +95,7 @@ def sh(
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         out = (r.stdout or "") + (r.stderr or "")
-        return r.returncode, _scrub_all(out, secrets)
+        return r.returncode, _denoise(_scrub_all(out, secrets))
     except subprocess.TimeoutExpired:
         return 124, f"timeout after {timeout}s"
 
@@ -208,9 +223,13 @@ def sync_one(task: dict, args, creds: dict) -> dict:
     )
     print(f"    ✓ 完成 {dt:.0f}s（pull {rec['pull_s']:.0f}s / push {rec['push_s']:.0f}s）")
 
-    if not args.keep_local:
+    if not args.keep_local and args.jobs <= 1:
         # 节点只是中转站：沙箱从 TCR 拉镜像，本地无需留存。
-        # 删两个 tag 后必须显式 prune，否则层数据不回收（实测 rm 后回收 0GiB）。
+        # ⚠️ 仅在串行模式下逐题清理。并发模式**绝不能**在此 prune ——
+        # SWE-bench 采用三层镜像（base → env → instance），多题共享 base/env 层，
+        # A 题 prune 会删掉 B 题正在 push 的层，实测报
+        #   `ctr: content digest sha256:...: not found`
+        # 导致 push/pull 大面积失败。并发下改为全批结束后统一 prune（见 main）。
         with _TAG_LOCK:
             sh(["ctr", "-n", NS, "images", "rm", src], timeout=120, quiet=True)
             sh(["ctr", "-n", NS, "images", "rm", dst], timeout=120, quiet=True)
@@ -218,6 +237,18 @@ def sync_one(task: dict, args, creds: dict) -> dict:
         rec["freed_gb"] = round(freed, 1)
         print(f"    ↺ 已清理本地中转层，回收 {freed:.1f}GiB，剩余 {free_gb():.0f}GiB")
     return rec
+
+
+def cleanup_all(tasks: list[dict], args, creds: dict) -> None:
+    """全批搬运结束后统一清理本地中转镜像（并发模式的清理时机）。"""
+    print("\n--- 统一清理本地中转层 ---")
+    for t in tasks:
+        src = to_mirror(t["official_image"], args.mirror)
+        dst = tcr_ref(t["task_id"], creds["registry"], creds["namespace"])
+        sh(["ctr", "-n", NS, "images", "rm", src], timeout=120, quiet=True)
+        sh(["ctr", "-n", NS, "images", "rm", dst], timeout=120, quiet=True)
+    freed = prune_unreferenced()
+    print(f"回收 {freed:.1f}GiB，剩余 {free_gb():.0f}GiB")
 
 
 def main() -> int:
@@ -228,14 +259,19 @@ def main() -> int:
     ap.add_argument("--only", action="append", default=[], help="只处理指定 task_id，可重复")
     ap.add_argument("--keep-local", action="store_true", help="保留本地 mirror tag")
     ap.add_argument("--check", action="store_true", help="只检查不搬运")
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help="跳过 image_map.json 里已 status=ok 的题（失败重跑时用）",
+    )
     ap.add_argument("--timeout", type=int, default=3600, help="单次 pull/push 超时(秒)")
     ap.add_argument(
         "--jobs",
         type=int,
         default=3,
-        help="并发题数。实测单题串行约 480s（pull 与 push 各占一半），"
-        "18 题串行需 2.4h；并发主要吃网络带宽，节点 32 核不是瓶颈。"
-        "不建议超过 4：磁盘写入与 TCR 侧限流会成为新瓶颈",
+        help="并发题数。实测单题串行约 480s（pull 31s + push 236s，push 是瓶颈）；"
+        "并发主要吃上行带宽，节点 32 核不是瓶颈。"
+        "不建议超过 4：TCR 侧限流与磁盘写入会成为新瓶颈",
     )
     ap.add_argument("--min-free-gb", type=int, default=25, help="磁盘剩余低于此值即停止，防塞满")
     ap.add_argument("--out", default="/data/swe-rl/data/image_map.json")
@@ -254,8 +290,22 @@ def main() -> int:
     ]
     if args.only:
         tasks = [t for t in tasks if t["task_id"] in set(args.only)]
+
+    # 载入既有映射，供 --resume 跳过与结果合并
+    out_path = Path(args.out)
+    prior: dict = {}
+    if out_path.exists():
+        try:
+            prior = json.loads(out_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            prior = {}
+    if args.resume:
+        before = len(tasks)
+        tasks = [t for t in tasks if prior.get(t["task_id"], {}).get("status") != "ok"]
+        print(f"[resume] 跳过已完成 {before - len(tasks)} 题，待处理 {len(tasks)} 题")
     if not tasks:
-        sys.exit("[x] 没有匹配的题目")
+        print("✓ 全部题目已完成，无需搬运")
+        return 0
 
     print(f"共 {len(tasks)} 题；mirror={args.mirror}；并发={args.jobs}")
     print(f"磁盘：{disk_line()}（低于 {args.min_free_gb}GB 剩余时自动停止）")
@@ -298,24 +348,27 @@ def main() -> int:
     print(f"\n{'=' * 60}\n成功 {len(ok)}/{len(results)}")
     for r in results:
         if r.get("status") != "ok":
-            print(f"  ✗ {r['task_id']}: {r.get('status')} {str(r.get('error', ''))[:200]}")
+            print(f"  ✗ {r['task_id']}: {r.get('status')} {str(r.get('error', ''))[:300]}")
     if ok:
         avg = sum(r.get("elapsed_s", 0) for r in ok) / len(ok)
         print(f"平均单题 {avg:.0f}s")
 
-    # 与已有映射合并，便于分批搬运时逐步累积
-    out_path = Path(args.out)
+    # 与已有映射合并，便于分批 / resume 逐步累积
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    merged = {}
-    if out_path.exists():
-        try:
-            merged = json.loads(out_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            merged = {}
+    merged = dict(prior)
     merged.update({r["task_id"]: r for r in results})
     out_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"映射已写入 {args.out}（累计 {len(merged)} 题）")
-    return 0 if len(ok) == len(results) else 1
+    done_ok = sum(1 for v in merged.values() if v.get("status") == "ok")
+    print(f"映射已写入 {args.out}（累计 {done_ok}/{len(merged)} 题成功）")
+
+    # 并发模式的清理时机：全批结束后统一做，避免删掉他人正在用的共享层
+    if not args.keep_local and not args.check and args.jobs > 1:
+        cleanup_all([t for t in tasks], args, creds)
+
+    failed = [r for r in results if r.get("status") != "ok"]
+    if failed:
+        print(f"\n重跑失败项：--resume（会自动跳过已成功的 {done_ok} 题）")
+    return 0 if not failed else 1
 
 
 if __name__ == "__main__":
