@@ -92,6 +92,8 @@ class AGSClient:
         tool_type: str = "custom",
         description: str = "",
         network_mode: str = "PUBLIC",
+        subnet_ids: list[str] | None = None,
+        security_group_ids: list[str] | None = None,
         default_timeout: str = "15m",
         command: list[str] | None = None,
         args: list[str] | None = None,
@@ -120,8 +122,29 @@ class AGSClient:
         req.DefaultTimeout = default_timeout
         req.RoleArn = role_arn
 
+        # 网络模式：PUBLIC / VPC / SANDBOX
+        #
+        # ⚠️ 生产场景应使用 **VPC**：沙箱容器直接接入指定子网，与同 VPC 内的
+        # GPU 节点内网互通，无需公网暴露、无需 NAT 端口转发。
+        # 用 PUBLIC 时沙箱挂在公网上，出口 IP 每次随机（实测 6 次采样得 6 个
+        # 互不相同的公网 IP，跨多个 /8 段），既无法做 IP 白名单，也不符合
+        # 「沙箱与训练侧走内网打通」的要求。
+        #
+        # VPC 模式的硬约束：沙箱与目标资源**必须同地域** —— 跨地域 VPC 不通，
+        # 需借助 CCN 云联网才能打通。
         net = m.NetworkConfiguration()
         net.NetworkMode = network_mode
+        if network_mode.upper() == "VPC":
+            if not subnet_ids:
+                raise AGSError(
+                    "network_mode=VPC 时必须提供 subnet_ids"
+                    "（应与目标 GPU 节点同子网，否则无法内网互通）"
+                )
+            vpc = m.VPCConfig()
+            vpc.SubnetIds = list(subnet_ids)
+            if security_group_ids:
+                vpc.SecurityGroupIds = list(security_group_ids)
+            net.VpcConfig = vpc
         req.NetworkConfiguration = net
 
         if storage_mounts:

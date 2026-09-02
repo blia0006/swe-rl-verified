@@ -48,7 +48,7 @@ def load_env() -> None:
     try:
         from dotenv import load_dotenv
 
-        load_dotenv(path)
+        load_dotenv(path, override=True)
     except ImportError:  # 没装 python-dotenv 时的极简回退
         for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()

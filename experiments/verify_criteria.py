@@ -47,7 +47,7 @@ GARBAGE_PATCH = """--- a/nonexistent_file_xyz.py
 def load_env() -> None:
     from dotenv import load_dotenv
 
-    load_dotenv(ROOT / ".env")
+    load_dotenv(ROOT / ".env", override=True)
 
 
 def tcr_image(task_id: str, registry: str, namespace: str, tag: str = "sbx") -> str:

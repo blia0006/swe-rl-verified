@@ -39,7 +39,7 @@ MAX_FILE_CHARS = 60000  # 单文件上限，防止 prompt 爆掉
 def load_env():
     from dotenv import load_dotenv
 
-    load_dotenv(ROOT / ".env")
+    load_dotenv(ROOT / ".env", override=True)
 
 
 def patched_files(patch):

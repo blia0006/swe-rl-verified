@@ -39,7 +39,7 @@ sys.path.insert(0, str(ROOT))
 def load_env() -> None:
     from dotenv import load_dotenv
 
-    load_dotenv(ROOT / ".env")
+    load_dotenv(ROOT / ".env", override=True)
 
 
 def ns() -> str:
