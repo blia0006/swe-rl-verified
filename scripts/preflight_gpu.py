@@ -117,8 +117,11 @@ def main():
     env_path = WORKDIR / ".env"
     if env_path.exists():
         text = env_path.read_text(encoding="utf-8")
+        # AGS_TOOL_NAME 曾漏投，导致训练时 79% 的打分抛异常、reward 全 0，
+        # 且 grad_norm 恒 0（参数完全没更新）—— 必须纳入检查
         need = ["TENCENTCLOUD_SECRET_ID", "TENCENTCLOUD_SECRET_KEY",
-                "E2B_API_KEY", "TCR_REGISTRY", "TCR_NAMESPACE"]
+                "E2B_API_KEY", "TCR_REGISTRY", "TCR_NAMESPACE",
+                "AGS_TOOL_NAME"]
         miss = [k for k in need if ("%s=" % k) not in text or ("%s=\n" % k) in text]
         check("凭证字段完整", not miss, "缺少 %s" % miss if miss else "沙箱可连")
 
@@ -161,8 +164,11 @@ def main():
             import torch
 
             free, total = torch.cuda.mem_get_info()
-            check("加载后显存余量", gb(free) > 6,
-                  "%.1fGB 空闲（需给 FSDP actor 留位）" % gb(free))
+            # 注意：此处是**单独**加载 vLLM 的场景，训练时 FSDP 先占位、
+            # vLLM 只拿剩余显存，两者不可直接比较。3B 权重 6.2GB，
+            # 训练实测占用约 8.1GB/24GB，因此这里 >3GB 即可视为通过。
+            check("加载后显存余量", gb(free) > 3,
+                  "%.1fGB 空闲（训练时 FSDP 先占位，实际分配与此不同）" % gb(free))
         except Exception as e:
             check("vLLM 加载", False, str(e)[:250])
 

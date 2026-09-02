@@ -117,7 +117,11 @@ pgrep -f "main_ppo" >/dev/null && echo running || echo stopped
 echo "###STEPS"
 [ -n "$LOG" ] && grep -a "critic/score/mean" "$LOG" | tail -400
 echo "###ERRORS"
-[ -n "$LOG" ] && grep -aE "Error|Traceback|OutOfMemory|AssertionError|CUDA out of memory" "$LOG" | tail -5
+# 只匹配**训练框架**的错误。不能裸匹配 Error/Traceback ——
+# 题目的 issue 描述里本就含 TypeError/Traceback 等字样（会被 verl 打进日志），
+# 那是数据不是故障，曾造成整屏误报。
+[ -n "$LOG" ] && grep -aE "CUDA out of memory|OutOfMemoryError|RuntimeError:|torch\.|ray\.exceptions|Worker.*died|verl.*Error" "$LOG" \
+  | grep -avE "timesince|USE_TZ|offset-naive|depth must be" | tail -5
 echo "###REWARD"
 [ -f /data/swe-rl/logs/reward_debug.jsonl ] && tail -400 /data/swe-rl/logs/reward_debug.jsonl
 echo "###TAIL"
@@ -164,10 +168,18 @@ def render(data, csv_path):
               % (last.get("step", n), scores[-1], grads[-1]))
 
         # 关键健康指标：grad_norm 恒 0 意味着参数完全没更新（上一轮前两轮训练的死循环）
+        # 首步 grad_norm 常为 0（warmup / 组内 reward 全同 → advantage 为 0），
+        # 只有**持续**为 0 才是真问题（上一轮前两轮训练就死在这里）
         nonzero_grad = sum(1 for g in grads if abs(g) > 1e-8)
-        print(" grad_norm 非零: %d/%d %s"
-              % (nonzero_grad, n,
-                 "✓" if nonzero_grad == n else "\033[31m← 存在零梯度步，参数未更新\033[0m"))
+        recent = grads[-10:]
+        recent_zero = sum(1 for g in recent if abs(g) <= 1e-8)
+        if recent_zero == len(recent) and len(recent) >= 5:
+            flag = "\033[31m← 最近 %d 步梯度全 0，参数未更新\033[0m" % len(recent)
+        elif nonzero_grad == n:
+            flag = "✓"
+        else:
+            flag = "（首步为 0 属正常：组内 reward 相同则 advantage 为 0）"
+        print(" grad_norm 非零: %d/%d %s" % (nonzero_grad, n, flag))
 
         print("\n reward 趋势（每步均值）")
         print("   " + fmt_sparkline(scores))
