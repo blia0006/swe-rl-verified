@@ -5,6 +5,11 @@
 > Agent 在沙箱中求解 SWE-bench Verified 题目，完整解题 tracing 作为 RL 训练数据，
 > 在 GPU 上用 VERL 做 GRPO 策略优化，形成 **SandBox 产出 → GPU 训练 → 回沙箱评估** 的闭环。
 
+> **核心结果（TKE Pod，192 step 正式训练）**：reward 前段均值 **0.050** → 后段均值 **0.139**，
+> 明确呈上升趋势；训练后 pass@1 **10% → 30%**。完整数据与图表见 §7.3、§7.4。
+>
+> ![reward 曲线（正式训练，192 step）](docs/reward_curve_192.png)
+
 ---
 
 ## 1. 快速开始
@@ -54,46 +59,12 @@ bash scripts/install_git_hooks.sh   # ⚠️ 必做：装敏感信息拦截钩�
 
 ---
 
-## 3. 远程监督通道 vs 正式训练执行环境
+## 3. 训练执行环境：TKE Pod
 
-> **⚠️ 勘误（09-03）**：下面的"云助手直连宿主机"通道是**运维监督**用的
-> （看日志/查显存/临时冒烟测试），设计初期一度也用它裸起训练容器。
-> 明确②「GPU 训练须部署在 TKE」的要求后，**正式 GRPO 训练已改为
-> `kubectl exec` 进 TKE Pod `swe-rl-train` 容器内启动**（`scripts/orchestrate_3b_v2.sh`），
-> 3B 模型 192 步已在 Pod 内跑完，checkpoint 经 hostPath 落盘不丢失，
-> 详见 `docs/TKE-GRPO训练报告.md`。以下"不用 pod"仅描述监督通道本身，
-> 不代表训练不跑在 TKE 上。
-
-```bash
-python3 scripts/node.py info                      # GPU / 显存 / 磁盘 / 容器
-python3 scripts/node.py run 'nvidia-smi'          # 宿主机执行任意命令
-python3 scripts/node.py watch <log>               # 跟踪日志
-python3 scripts/node.py put <local> <remote>      # 投放文件（分块 base64）
-python3 scripts/node.py nohup '<cmd>' --log <f>   # 后台起长任务
-python3 scripts/monitor.py                        # 训练实时面板
-```
-
-链路：本地终端 → 腾讯云**云助手 TAT** API → 节点 tat_agent → 宿主机 → 回传。
-
-| | 云助手通道 | `kubectl exec` 进 pod |
-|---|---|---|
-| 集群公网端点 | 不需要 | 需要 |
-| kubeconfig | 不需要 | 需要，且会过期 |
-| 节点入站端口 | **零暴露** | 需放通 API Server |
-
-> 上一轮项目的 kubeconfig 在本轮开工时已失效，`kubectl` 完全连不上 ——
-> 这反过来印证了「靠 pod + kubectl 监督」链路本身是脆的。
-
-**`ctr` 直起容器**仅用于本机冒烟测试 / 调试续训（节点只有 containerd，无 docker）：
-
-```bash
-bash scripts/start_train_container.sh preflight   # 训练前冒烟测试
-bash scripts/start_train_container.sh train       # 调试/续训用，非 TKE 正式训练
-```
-
-工作目录 bind mount 到宿主机 `/data/swe-rl`，**容器可随时重建、数据不丢**。
-**正式训练改用 TKE Pod**（`deploy/gpu-pod.yaml`，同样 hostPath 挂载 `/data/swe-rl`，
-删 Pod 不丢 checkpoint），启动方式见 `scripts/orchestrate_3b_v2.sh`：
+正式 GRPO 训练部署在 TKE Pod `swe-rl-train` 容器内，通过 `kubectl exec` 启动
+（`scripts/orchestrate_3b_v2.sh`）。3B 模型 192 步已在 Pod 内跑完，退出码 0，
+checkpoint 经 hostPath 落盘到宿主机 `/data/swe-rl`，删 Pod 不丢数据，
+详见 `docs/TKE-GRPO训练报告.md`。
 
 ```bash
 bash deploy/apply.sh                 # 部署/确认 TKE Pod swe-rl-train 就位
