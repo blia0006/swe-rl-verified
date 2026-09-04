@@ -1,0 +1,21 @@
+{
+  "note": "第二次运行：修复了集群 split.json 被 verify_criteria.py 覆盖导致 eval 集缩水（10题->6题->可用仅2题）的问题后，用完整 10 道 eval 题（沙箱验证全部可用）重新跑通的最终结果。",
+  "before_base": {
+    "run_id": "before_base",
+    "n_tasks": 10,
+    "n_rollouts": 10,
+    "n_resolved": 1,
+    "pass_at_1": 0.1,
+    "mean_reward": 0.1,
+    "resolved_tasks": ["pytest-dev__pytest-5809"]
+  },
+  "after_ckpt192_step192": {
+    "run_id": "after_ckpt192",
+    "n_tasks": 10,
+    "n_rollouts": 10,
+    "n_resolved": 3,
+    "pass_at_1": 0.3,
+    "mean_reward": 0.3,
+    "resolved_tasks": ["pytest-dev__pytest-5809", "django__django-14089", "scikit-learn__scikit-learn-12585"]
+  }
+}

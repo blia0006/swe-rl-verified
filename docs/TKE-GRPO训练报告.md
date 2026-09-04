@@ -49,7 +49,17 @@
 | **3B 全量（09-03，本报告）** | **192** | **TKE Pod（`kubectl exec`）** | `checkpoints_3b_v1` | **满足要求②的正式交付物** |
 | 7B（09-03，续训调试） | 60 | 宿主机 `ctr`（`train_guard.sh`） | `checkpoints` | OOM 补丁验证会话，与 TKE 要求无关，不作为②的交付证据 |
 
+## 训练后正式评测（09-04 补齐）
+
+已用 `scripts/eval_before_after.sh` 从 `global_step_192` 权重做离线评测，无需重新训练：
+合并权重 → vLLM serve → 沙箱跑同批 10 道 eval held-out 题 → pytest 判分。
+
+- pass@1：训练前 1/10（10%） → 训练后 3/10（30%）
+- 中途发现并修复一个 bug：`experiments/verify_criteria.py` 曾覆盖 `data/split.json`
+  把 eval 集缩水到仅 2 题可用，导致首次跑出假阴性（0%/0%）；用正确的 10 题池重跑后
+  得到上述真实结果。详见 `docs/PROGRESS.md`「2026-09-04」条目与
+  `data/tracing_results/pass_at_1_before_after.json`。
+
 ## 后续建议
 
-1. 若需进一步验收，可直接从 Pod（或 hostPath `/data/swe-rl/checkpoints_3b_v1`）取 `global_step_192` 权重做离线评测，无需重新训练。
-2. `docs/GRPO训练完成报告.md`、`docs/PROGRESS.md`、`README.md` 中仍有"不用 pod / ctr 直起"的表述，那是**设计初期（09-02）的决策记录**，已于 09-03 整改为 TKE Pod 执行；三份文档已加追记/勘误链接到本报告，避免后续误读为"最终仍未用 TKE"。
+1. `docs/GRPO训练完成报告.md`、`docs/PROGRESS.md`、`README.md` 中仍有"不用 pod / ctr 直起"的表述，那是**设计初期（09-02）的决策记录**，已于 09-03 整改为 TKE Pod 执行；三份文档已加追记/勘误链接到本报告，避免后续误读为"最终仍未用 TKE"。

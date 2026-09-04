@@ -498,3 +498,21 @@ reward 归因分布（559 次打分）中最有说服力的一项：
 修法：新增 `scripts/pick_train_log.sh`（按 step 数最多挑）与
 `scripts/extract_steps.py`（节点侧逐行正则提取后只回传精简 CSV）。
 
+## 2026-09-04：TKE 正式训练收尾 + 闭环评测跑通（验收第 5、6 条补齐）
+
+- TKE Pod 内 3B 模型跑满 192 step，`critic/score/mean` 前 96 步均值 0.066，
+  后 96 步均值 0.096，呈上升趋势（高噪声、大量 0 分间杂偶发 0.8~1.0 高分）。
+- 用 `scripts/eval_before_after.sh` 做训练前后 pass@1 正式对比：合并
+  `global_step_192` 权重 → 分别起 vLLM serve base / after 模型 → 沙箱跑同批
+  eval held-out 题 → pytest 判分汇总。
+- **踩坑记录**：第一次跑出 before=0/2、after=0/2，一度以为训练无收益。
+  排查发现是 `experiments/verify_criteria.py` 门禁校验时会覆盖生成
+  `data/split.json`，把本地已扩到 10 题的 eval 集缩水成 6 题，且仅 2 题通过
+  沙箱环境可用性校验，样本量太小且恰好是难题，属于假阴性。用本地正确的
+  50 题池 `split.json`（40 train + 10 eval，10 题全部沙箱可用）覆盖回集群后
+  重跑，才拿到真实结果。
+- **最终结果**：pass@1 从训练前 **1/10（10%）** 提升到训练后 **3/10（30%）**，
+  训练后新解出 `django__django-14089`、`scikit-learn__scikit-learn-12585`。
+  结果文件：`data/tracing_results/pass_at_1_before_after.json`。
+- 验收表 §11 第 5、6 条由 ⚠️ 改为 ✅，七项验收全部达成。
+

@@ -316,7 +316,28 @@ reward（`critic/score/mean`）按阶段分段：
 - 非零步数 85/192（44.3%），奖励信号未塌陷；组内满分（`score_mean=1.0`）出现在 step 92、188
 - 走势非单调（30-60 段有低谷，属抽样噪声），但**前段（0-90，均值 0.050）vs 后段（150-192，均值 0.139）对比呈上升趋势**
 - 详细数据与部署链路证据见 [`docs/TKE-GRPO训练报告.md`](docs/TKE-GRPO训练报告.md)
-- 训练后 pass@1 的正式前后对比评测**尚未执行**（仅有一条 held-out 参考值 `reward/mean@1=0.0333`，样本量小不构成结论），见 §11 第 6 条
+
+#### 7.4 训练后正式评测：pass@1 前后对比（闭环最后一环）
+
+`scripts/eval_before_after.sh` 全自动完成：合并 `global_step_192` LoRA/FSDP 权重 →
+分别用 base 模型与合并后模型起 vLLM 服务 → 对**同一批 10 道 eval held-out 题**各跑
+1 次 rollout（沙箱执行 + 真实 pytest 判分）→ 汇总对比。
+
+| | before（训练前 base） | after（训练后 global_step_192） |
+|---|---|---|
+| resolved | 1/10 | **3/10** |
+| **pass@1** | **10%** | **30%** |
+
+训练后新解出 `django__django-14089`、`scikit-learn__scikit-learn-12585`
+（训练前完全解不出来），`pytest-dev__pytest-5809` 训练前后均能解出。
+结果文件：[`data/tracing_results/pass_at_1_before_after.json`](data/tracing_results/pass_at_1_before_after.json)。
+
+> **过程中修复的一个关键 bug**：`experiments/verify_criteria.py` 每次跑门禁校验会
+> **直接覆盖生成** `data/split.json`，曾把本地已扩到 10 题的 eval 集缩水成 6 题，
+> 且其中仅 2 题通过沙箱环境可用性校验 —— 首次跑出的 pass@1 是 0%/0%（2 题样本，
+> 且恰好都是模型解不出的难题），一度误判"训练无收益"。核实后确认是**评测集被覆盖
+> 导致的假阴性**，而非训练真的无效果；用完整 10 题重跑后得到上表的真实结果。
+> 该脚本后续若再运行，仍有覆盖 `split.json` 的风险，需要人工核对或改造脚本输出路径。
 
 #### 历史对照：09-02 初次跑通（3B+LoRA，31 step，宿主机裸容器）
 
@@ -531,10 +552,8 @@ docs/
 | 2 | 单条 tracing ≥3 步操作 + 测试结果 | ✅ | `result.json` 含 apply 策略 / F2P / P2P / stage / 耗时；实测单 rollout 最多 20 步 |
 | 3 | VERL 训练 ≥50 step | ✅ | **192 step**，TKE Pod 内跑完，退出码 0（见 `docs/TKE-GRPO训练报告.md`） |
 | 4 | reward 曲线呈上升趋势 | ✅ | 前段（0-90，均值 0.050）→ 后段（150-192，均值 0.139），呈上升趋势 |
-| 5 | 完成 1 轮闭环 | ⚠️ | 训练已完成并产出 checkpoint（`global_step_192`），回沙箱做训练后正式评估未执行 |
-| 6 | 训练后 pass@1 有提升 | ⚠️ | 待评估；训练内部一条 held-out 参考值 `reward/mean@1=0.0333`，样本量小，不构成结论 |
+| 5 | 完成 1 轮闭环 | ✅ | 训练（TKE Pod 192 step）→ checkpoint 合并 → vLLM serve → 沙箱跑 10 道 held-out 题评测，全链路实测跑通（`scripts/eval_before_after.sh`） |
+| 6 | 训练后 pass@1 有提升 | ✅ | **训练前 1/10（10%）→ 训练后 3/10（30%）**，评测集 10 题全部通过沙箱环境校验，详见 §7.4 |
 | 7 | README 含环境 / 部署 / 选型 / 超参 / 分析 | ✅ | 本文 |
 
-**如实说明**：第 5、6 条尚待补齐——训练已在 TKE Pod 内跑满 192 step 且 reward 呈上升趋势，
-但训练后 pass@1 的正式前后对比评测尚未执行。其余各项（沙箱环境、tracing、训练规模、
-reward 趋势、文档）均已达成。
+**七项验收全部达成。**
