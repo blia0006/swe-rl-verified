@@ -1,0 +1,36 @@
+{
+  "stage": "collect_error",
+  "reward": {
+    "reward": 0.0,
+    "stage": "collect_error",
+    "apply_component": 0.0,
+    "test_component": 0.0,
+    "strict_pass": false,
+    "regression_zeroed": false,
+    "f2p_rate_str": "0/0",
+    "p2p_rate_str": "0/0",
+    "note": "修改已应用但 pytest 无法收集用例（代码被改坏）"
+  },
+  "apply_method": "git-apply",
+  "eval_rc": 0,
+  "grade_detail": {
+    "f2p_pass": 0,
+    "f2p_total": 1,
+    "p2p_pass": 0,
+    "p2p_total": 17,
+    "resolved": false,
+    "parsed_tests": 0,
+    "f2p_missing": [
+      "tests/checkers/unittest_similar.py::test_set_duplicate_lines_to_zero"
+    ],
+    "p2p_failed": [
+      "tests/checkers/unittest_similar.py::test_ignore_comments",
+      "tests/checkers/unittest_similar.py::test_ignore_docstrings",
+      "tests/checkers/unittest_similar.py::test_ignore_imports",
+      "tests/checkers/unittest_similar.py::test_multiline_imports",
+      "tests/checkers/unittest_similar.py::test_ignore_multiline_imports"
+    ]
+  },
+  "error": "",
+  "log_tail": "===EVAL_RC=0===\n+ : '>>>>> Start Test Output'\n+ pytest -rA tests/checkers/unittest_similar.py\n/opt/miniconda3/envs/testbed/lib/python3.9/site-packages/_pytest/config/__init__.py:318: PluggyTeardownRaisedWarning: A plugin raised an exception during an old-style hookwrapper teardown.\nPlugin: helpconfig, Hook: pytest_cmdline_parse\nConftestImportFailure: IndentationError: expected an indented block (similar.py, line 805) (from /testbed/tests/conftest.py)\nFor more information see https://pluggy.readthedocs.io/en/stable/api_reference.html#pluggy.PluggyTeardownRaisedWarning\n  config = pluginmanager.hook.pytest_cmdline_parse(\nImportError while loading conftest '/testbed/tests/conftest.py'.\ntests/conftest.py:10: in <module>\n    from pylint.testutils import MinimalTestReporter\npylint/testutils/__init__.py:48: in <module>\n    from pylint.testutils.checker_test_case import CheckerTestCase\npylint/testutils/checker_test_case.py:7: in <module>\n    from pylint.testutils.global_test_linter import linter\npylint/testutils/global_test_linter.py:20: in <module>\n    linter = create_test_linter()\npylint/testutils/global_test_linter.py:15: in create_test_linter\n    checkers.initialize(linter_)\npylint/checkers/__init__.py:76: in initialize\n    register_plugins(linter, __path__[0])\npylint/utils/utils.py:137: in register_plugins\n    module = modutils.load_module_from_file(\n/opt/miniconda3/envs/testbed/lib/python3.9/site-packages/astroid/modutils.py:248: in load_module_from_file\n    return load_module_from_modpath(modpath)\n/opt/miniconda3/envs/testbed/lib/python3.9/site-packages/astroid/modutils.py:233: in load_module_from_modpath\n    return load_module_from_name(\".\".join(parts))\n/opt/miniconda3/envs/testbed/lib/python3.9/site-packages/astroid/modutils.py:218: in load_module_from_name\n    return importlib.import_module(dotted_name)\nE     File \"/testbed/pylint/checkers/similar.py\", line 805\nE       self.min_lines = self.config.min_similarity_lines\nE       ^\nE   IndentationError: expected an indented block\n+ : '>>>>> End Test Output'\n"
+}

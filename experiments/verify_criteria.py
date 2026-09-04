@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
-"""
-判据适配层的真实沙箱验证（本轮最关键的一次验证）
-================================================
+"""题目有效性验证（官方判据链路）
+==================================
 
-判据层是全链路的地基：reward 错了，训练必然空转（上一轮就因判分链路的
-异常处理 bug，把 78 次 apply 失败误报成"基础设施故障"，差点据此写错结论）。
-
-因此必须用**真实镜像 + 真实 pytest** 验证三个场景，缺一不可：
+判据是 RL 的地基：reward 错了，训练必然空转。因此每道题都必须用
+**真实镜像 + 官方 test_cmd** 验证三个场景，缺一不可：
 
 | 场景 | 期望 | 验证了什么 |
 |---|---|---|
-| ① 空解（不打 patch） | F2P **全 fail**、P2P 全 pass | 题目本身有效：修复前确实失败，且判据能识别 |
-| ② golden patch | F2P **全 pass**、P2P 全 pass、reward=1.0 | 判据能识别正确答案（否则模型永远拿不到分） |
-| ③ 垃圾 patch | apply 失败 或 collect_error | 防作弊/防误判链路正常 |
+| ① 空解（不打补丁） | F2P 未全过、P2P 全过 | 题目有区分度，且镜像与标注一致 |
+| ② golden patch | F2P 全过、P2P 全过、reward=1.0 | 判据能识别正确答案（否则模型永远拿不到分） |
+| ③ 垃圾 patch | apply 失败 | 防作弊链路正常 |
 
-只要 ① 或 ② 不成立，这道题就**不可用**（可能是镜像与数据集版本不匹配），
-必须从题目集里剔除 —— 上一轮 21 题里有 6 题因此被剔除，这次提前查。
+② 不成立 → 该题**不可用**（多为镜像与数据集版本不匹配），必须剔除。
 
-用法：
-    python3 experiments/verify_criteria.py --task scikit-learn__scikit-learn-14141
-    python3 experiments/verify_criteria.py --all          # 全部已搬运的题
-    python3 experiments/verify_criteria.py --all --jobs 3
+## 与上一版的关键区别
+
+上一版用 `pytest -rA <单个 test id>` 判所有题，对 django（runtests.py）、
+sphinx（tox）、sympy（bin/test）三类共 9/20 题**完全不兼容**，导致这些题
+恒判 0 分 —— 这是上一轮"近半数训练步 score 全 0"的地基性根因。
+本版改走 `pipeline/sandbox_eval`，命令与解析器均取自官方 `swebench` 包，
+逐题按 (repo, version) 分派。
+
+## 沙箱复用与日志
+
+同一沙箱实例内连续跑三场景，每次判分前 `git reset --hard` 还原，
+省掉 2 次启动开销。并发时**每题日志先缓冲、结束后整块输出** ——
+逐行 print 在多线程下会交错，实测出现"A 题标题下显示 B 题结果"的错觉，
+足以导致误判。
 """
 
 from __future__ import annotations
@@ -29,12 +35,13 @@ import argparse
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-VERIFY_SCRIPT = ROOT / "sandbox_agent" / "swebench_verify.py"
 GARBAGE_PATCH = """--- a/nonexistent_file_xyz.py
 +++ b/nonexistent_file_xyz.py
 @@ -1,3 +1,3 @@
@@ -45,276 +52,233 @@ GARBAGE_PATCH = """--- a/nonexistent_file_xyz.py
 
 
 def load_env() -> None:
+    import logging
+
     from dotenv import load_dotenv
 
     load_dotenv(ROOT / ".env", override=True)
+    # e2b SDK 对每个 HTTP 请求打两条 INFO 日志。单题三场景有数十次文件/命令调用，
+    # 会把真正的判定结果冲走（实测有效输出被噪声淹没到需要 grep 才能看）。
+    for name in ("e2b", "e2b.api.client_sync", "httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def tcr_image(task_id: str, registry: str, namespace: str, tag: str = "sbx") -> str:
-    """与 scripts/pod_build_sandbox_images.py::tcr_ref 保持一致。
+    """`sbx` 是注入了 AGS envd agent 的融合镜像。
 
-    默认用 `sbx` 标签 —— 即注入了 AGS envd agent 的融合镜像。
-    原始 `v1` 标签是官方镜像，缺 agent，沙箱起不来（init command path error）。
+    原始 `v1`（官方镜像）缺 agent，沙箱起不来（init command path error）——
+    详见 scripts/build_sandbox_images.sh 的说明。
     """
-    slug = task_id.replace("__", "-").lower()
-    return f"{registry}/{namespace}/sweb-{slug}:{tag}"
+    return f"{registry}/{namespace}/sweb-{task_id.replace('__', '-').lower()}:{tag}"
 
 
-def sbx_run(sbx, cmd: str, timeout: int = 900) -> tuple[int, str]:
-    """执行沙箱命令并把异常收敛成返回值。
+def sbx_probe(sbx: Any) -> tuple[bool, str]:
+    """环境自检：官方镜像应有 /testbed 与 conda testbed 环境。"""
+    from pipeline.sandbox_eval import sbx_run
 
-    ⚠️ e2b SDK 在**退出码非 0 时直接抛异常**，不返回 exit_code。
-    因此 `if res.exit_code != 0` 这类判断永远走不到，所有失败都会被外层
-    except 兜成"沙箱调用异常" —— 上一轮实测导致 78 次 apply 失败被误报成
-    基础设施故障，失败归因完全失真。必须在这里收敛。
-    """
-    try:
-        res = sbx.commands.run(cmd, user="root", timeout=timeout)
-        return (res.exit_code or 0), (res.stdout or "") + (res.stderr or "")
-    except Exception as e:
-        code = getattr(e, "exit_code", None)
-        out = (getattr(e, "stdout", "") or "") + (getattr(e, "stderr", "") or "")
-        return (code if code is not None else 1), (out or str(e))
+    _, out = sbx_run(sbx, "ls -d /testbed && ls /opt/miniconda3/envs/", 120)
+    return ("/testbed" in out and "testbed" in out), out
 
 
 def verify_task(task: dict, registry: str, namespace: str, tool_id: str) -> dict:
-    """对单题跑三场景验证。"""
     from clients.ags import AGSClient
-    from clients.sandbox import start_instance_with_warmup
-    from e2b_code_interpreter import Sandbox
+    from clients.sandbox import connect_with_retry, start_instance_with_warmup
 
-    from pipeline.reward import Stage, compute_reward, outcome_from_json
+    from pipeline.sandbox_eval import run_eval
 
     task_id = task["task_id"]
     image = tcr_image(task_id, registry, namespace)
-    rec: dict = {"task_id": task_id, "image": image, "scenarios": {}}
-    print(f"\n{'=' * 70}\n=== {task_id}\n    镜像: {image}", flush=True)
+    rec: dict[str, Any] = {"task_id": task_id, "image": image, "scenarios": {}}
+
+    buf: list[str] = [f"{'=' * 70}", f"=== {task_id}", f"    镜像: {image}"]
+
+    def flush_block() -> dict:
+        print("\n" + "\n".join(buf), flush=True)
+        return rec
 
     ags = AGSClient()
     t0 = time.time()
     try:
-        # 走带预热等待的封装：AGS 首次使用新镜像需约 4 分钟预热，
-        # 期间报 ImagePrepare / still preparing，都不是真故障（详见 clients/sandbox.py）
-        instance_id, eff = start_instance_with_warmup(
-            ags, tool_id, image, cpu="2", memory="4Gi"
+        instance_id, _ = start_instance_with_warmup(
+            ags, tool_id, image, cpu="2", memory="4Gi", verbose=False
         )
-    except Exception as e:
-        rec["verdict"] = "instance_failed"
-        rec["error"] = str(e)[:500]
-        print(f"    ✗ 沙箱启动失败：{str(e)[:300]}")
-        return rec
-    print(f"    实例 {instance_id} 启动 {time.time() - t0:.1f}s")
+    except Exception as e:  # noqa: BLE001
+        rec.update(verdict="instance_failed", error=str(e)[:500])
+        buf.append(f"    ✗ 沙箱启动失败：{str(e)[:300]}")
+        return flush_block()
+    buf.append(f"    实例 {instance_id} 启动 {time.time() - t0:.1f}s")
 
     try:
-        sbx = Sandbox.connect(instance_id)
+        sbx = connect_with_retry(instance_id)
 
-        # 环境自检：官方镜像应有 /testbed 与 conda 环境
-        code, out = sbx_run(sbx, "ls -d /testbed && ls /opt/miniconda3/envs/", 120)
-        rec["layout_ok"] = "/testbed" in out and "testbed" in out
-        print(f"    布局检查: {'✓' if rec['layout_ok'] else '✗ ' + out[:200]}")
-        if not rec["layout_ok"]:
+        code, out = sbx_probe(sbx)
+        rec["layout_ok"] = code
+        buf.append(f"    布局检查: {'✓' if code else '✗ ' + out[:200]}")
+        if not code:
             rec["verdict"] = "layout_mismatch"
-            return rec
+            return flush_block()
 
-        # 注入判据脚本与题目规格
-        # ⚠️ 必须显式 user="root"：SWE-bench 官方镜像里没有名为 `user` 的账号，
-        # 而 e2b SDK 默认以 `user` 身份写文件，会报
-        #   AuthenticationException: error looking up user 'user'
-        spec = {
-            "task_id": task_id,
-            "fail_to_pass": task["fail_to_pass"],
-            "pass_to_pass": task["pass_to_pass"],
-            "test_patch": task["test_patch"],
-        }
-        sbx_run(sbx, "mkdir -p /task", 60)
-        for path, content in (
-            ("/task/swebench_verify.py", VERIFY_SCRIPT.read_text(encoding="utf-8")),
-            ("/task/spec.json", json.dumps(spec, ensure_ascii=False)),
-            ("/task/golden.diff", task["golden_patch"]),
-            ("/task/garbage.diff", GARBAGE_PATCH),
-        ):
-            sbx.files.write(path, content, user="root")
-
-        # ⚠️ 必须用镜像自带的 conda python，不能用系统 python3：
-        # 官方镜像的系统 python 可能老到不支持 `from __future__ import annotations`
-        # （实测报 "future feature annotations is not defined"），
-        # 而 /opt/miniconda3/envs/testbed 才是题目实际的运行环境
-        # 判据脚本本身用**系统 python3**（3.10）执行 —— testbed 环境的解释器
-        # 可能老至 3.6（随题目依赖而定），跑不了稍新的语法。
-        # 脚本内部会自行调用 testbed 的 python 来跑 pytest（见 TESTBED_PY）。
-        # ⚠️ 必须写**绝对路径** /usr/bin/python3：
-        # 镜像的 PATH 把 conda 排在前面，裸写 `python3` 会解析到 testbed 环境的
-        # python3.6（实测报 subprocess 无 capture_output 参数）。
-        # 判据脚本要跑在系统 3.10 上，pytest 才由它内部调 testbed python 执行。
-        base = "/usr/bin/python3 /task/swebench_verify.py --spec /task/spec.json"
-
-        def scenario(name: str, extra: str) -> dict:
-            t = time.time()
-            code, out = sbx_run(sbx, f"{base} --out /task/r.json --restore {extra}", 900)
-            try:
-                payload = sbx.files.read("/task/r.json", user="root")
-                res = json.loads(payload)
-            except Exception as e:
-                print(f"    ✗ {name}: 读不到 result.json（{str(e)[:150]}）")
-                print(f"      命令输出: {out[-400:]}")
-                return {"error": "no_result", "stdout_tail": out[-800:]}
-            res["_elapsed_s"] = round(time.time() - t, 1)
-            return res
-
-        # ---------- ① 空解基线 ----------
-        r = scenario("空解", "")
-        f2p, p2p = r.get("fail_to_pass", {}), r.get("pass_to_pass", {})
-        empty_ok = (
-            r.get("stage") == "tested"
-            and f2p.get("passed", -1) == 0            # F2P 必须全 fail
-            and p2p.get("passed") == p2p.get("total")  # P2P 必须全 pass
+        scenarios = (
+            ("① 空解     ", None),
+            ("② golden   ", task["golden_patch"]),
+            ("③ 垃圾patch", GARBAGE_PATCH),
         )
-        rec["scenarios"]["empty"] = {
-            "stage": r.get("stage"),
-            "f2p": f"{f2p.get('passed')}/{f2p.get('total')}",
-            "p2p": f"{p2p.get('passed')}/{p2p.get('total')}",
-            "ok": empty_ok,
-            "elapsed_s": r.get("_elapsed_s"),
-            "tail": "" if empty_ok else str(r.get("raw_tail", ""))[-1200:],
-        }
-        print(
-            f"    ① 空解      stage={str(r.get('stage')):14s} "
-            f"F2P={f2p.get('passed')}/{f2p.get('total')} "
-            f"P2P={p2p.get('passed')}/{p2p.get('total')} "
-            f"{'✓' if empty_ok else '✗ 期望 F2P=0/N 且 P2P 全过'} "
-            f"({r.get('_elapsed_s')}s)"
-        )
+        for label, patch in scenarios:
+            t1 = time.time()
+            r = run_eval(sbx, task, patch, timeout=1800)
+            d = r.to_dict()
+            d["elapsed_s"] = round(time.time() - t1, 1)
+            rec["scenarios"][label.strip()] = d
+            f2p = f"{r.outcome.f2p_passed}/{r.outcome.f2p_total}" if r.outcome else "-"
+            p2p = f"{r.outcome.p2p_passed}/{r.outcome.p2p_total}" if r.outcome else "-"
+            buf.append(
+                f"    {label} stage={r.stage.value:14s} F2P={f2p:7s} P2P={p2p:8s} "
+                f"reward={r.reward.reward:.3f} ({d['elapsed_s']}s)"
+            )
+            if r.error:
+                buf.append(f"                 └ {r.error[:150]}")
 
-        # ---------- ② golden patch ----------
-        r = scenario("golden", "--patch /task/golden.diff")
-        f2p, p2p = r.get("fail_to_pass", {}), r.get("pass_to_pass", {})
-        golden_ok = r.get("stage") == "tested" and f2p.get("passed") == f2p.get("total")
-        reward = 0.0
-        if r.get("stage") == "tested":
-            bd = compute_reward(Stage.TESTED, outcome_from_json(r))
-            reward = bd.reward
-        rec["scenarios"]["golden"] = {
-            "stage": r.get("stage"),
-            "f2p": f"{f2p.get('passed')}/{f2p.get('total')}",
-            "p2p": f"{p2p.get('passed')}/{p2p.get('total')}",
-            "apply_strategy": r.get("apply_strategy"),
-            "reward": reward,
-            "ok": golden_ok and abs(reward - 1.0) < 1e-6,
-            "elapsed_s": r.get("_elapsed_s"),
-            "tail": "" if golden_ok else str(r.get("raw_tail", ""))[-1200:],
-        }
-        print(
-            f"    ② golden    stage={str(r.get('stage')):14s} "
-            f"F2P={f2p.get('passed')}/{f2p.get('total')} "
-            f"P2P={p2p.get('passed')}/{p2p.get('total')} "
-            f"reward={reward:.3f} "
-            f"{'✓' if rec['scenarios']['golden']['ok'] else '✗ 期望 F2P 全过且 reward=1.0'} "
-            f"({r.get('_elapsed_s')}s)"
+        rec["verdict"] = judge(rec["scenarios"])
+        # 空解基线 reward = 该题的"白给分"。数值越高说明区分度越差，
+        # 训练时这部分 reward 与策略好坏无关，是纯噪声。供筛题排序用。
+        rec["baseline_reward"] = (
+            rec["scenarios"].get("① 空解", {}).get("reward") or {}
+        ).get("reward")
+        buf.append(
+            f"    → 判定: {rec['verdict'].upper()}  空解基线={rec['baseline_reward']}"
         )
-
-        # ---------- ③ 垃圾 patch ----------
-        r = scenario("垃圾", "--patch /task/garbage.diff")
-        garbage_ok = r.get("stage") in ("apply_failed", "collect_error")
-        rec["scenarios"]["garbage"] = {
-            "stage": r.get("stage"),
-            "ok": garbage_ok,
-            "elapsed_s": r.get("_elapsed_s"),
-        }
-        print(
-            f"    ③ 垃圾patch stage={str(r.get('stage')):14s} "
-            f"{'✓' if garbage_ok else '✗ 期望 apply_failed'} ({r.get('_elapsed_s')}s)"
-        )
-
-        rec["verdict"] = (
-            "usable"
-            if (empty_ok and rec["scenarios"]["golden"]["ok"] and garbage_ok)
-            else "unusable"
-        )
-        print(f"    → 判定: {rec['verdict'].upper()}")
+        return flush_block()
+    except Exception as e:  # noqa: BLE001
+        rec.update(verdict="error", error=f"{type(e).__name__}: {str(e)[:400]}")
+        buf.append(f"    ✗ 异常：{type(e).__name__}: {str(e)[:300]}")
+        return flush_block()
     finally:
         try:
             ags.stop_instance(instance_id)
-        except Exception as e:
-            print(f"    ⚠️ 实例回收失败（请手动检查 {instance_id}）：{e}")
-    return rec
+        except Exception:  # noqa: BLE001,S110 —— 回收失败不应影响验证结论
+            pass
+
+
+def judge(sc: dict[str, dict]) -> str:
+    """三场景合起来判定题目是否可用。
+
+    ## 判定口径（含一次实测修正）
+
+    最初要求「空解时 F2P **全部** fail」，实测 django-16429 出现 F2P=1/4 ——
+    并非题目无效，而是官方 F2P 列表里含 `subtest`，同名条目被 runner 拆成多次
+    上报，其中一部分与本 bug 无关、本来就通过。SWE-bench Verified 里这类
+    标注噪声很常见。
+
+    因此改为**有区分度**判定：
+
+    | 场景 | 要求 | 理由 |
+    |---|---|---|
+    | ① 空解 | F2P 未全过（`pass < total`） | 只要不是"什么都不做就满分"，题目就有学习信号 |
+    | ① 空解 | P2P 必须全过 | 若空解就有 P2P 挂，说明镜像环境与标注不一致，reward 无意义 |
+    | ② golden | resolved 且 reward=1.0 | 判据必须能认出正确答案，否则模型永远拿不到分 |
+    | ③ 垃圾 | apply 被拒 | 防作弊链路正常 |
+
+    空解基线 reward 一并记录：它是该题的"白给分"，数值越高说明区分度越差，
+    供后续筛题排序用。
+    """
+    empty = sc.get("① 空解", {})
+    golden = sc.get("② golden", {})
+    garbage = sc.get("③ 垃圾patch", {})
+
+    eg = empty.get("grade_detail") or {}
+    gg = golden.get("grade_detail") or {}
+
+    empty_has_signal = (
+        empty.get("stage") == "tested"
+        and eg.get("f2p_total", 0) > 0
+        and eg.get("f2p_pass", 0) < eg.get("f2p_total", 0)
+    )
+    empty_p2p_clean = eg.get("p2p_total") is not None and eg.get("p2p_pass") == eg.get(
+        "p2p_total"
+    )
+    golden_ok = (
+        golden.get("stage") == "tested"
+        and gg.get("resolved") is True
+        and abs((golden.get("reward") or {}).get("reward", 0) - 1.0) < 1e-6
+    )
+    garbage_ok = garbage.get("stage") in ("apply_failed", "collect_error")
+
+    if empty_has_signal and empty_p2p_clean and golden_ok and garbage_ok:
+        return "usable"
+    reasons = []
+    if not empty_has_signal:
+        reasons.append("空解无区分度(F2P全过或未跑成)")
+    if not empty_p2p_clean:
+        reasons.append("空解P2P即有失败(镜像与标注不一致)")
+    if not golden_ok:
+        reasons.append("golden未判满分")
+    if not garbage_ok:
+        reasons.append("垃圾补丁未被拒")
+    return "unusable:" + "+".join(reasons)
 
 
 def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--task", action="append", help="指定 task_id，可重复")
+    ap.add_argument("--all", action="store_true", help="验证 tasks.jsonl 全部题目")
+    ap.add_argument("--jobs", type=int, default=1, help="并发题目数")
+    ap.add_argument("--out", default="data/criteria_check.json")
+    args = ap.parse_args()
+
     load_env()
     import os
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--task", action="append", default=[], help="指定 task_id，可重复")
-    ap.add_argument("--all", action="store_true", help="验证 tasks.jsonl 全部题目")
-    ap.add_argument("--jobs", type=int, default=1, help="并发题数")
-    ap.add_argument("--tasks-file", default=str(ROOT / "data" / "tasks.jsonl"))
-    ap.add_argument("--out", default=str(ROOT / "data" / "criteria_check.json"))
-    args = ap.parse_args()
-
-    registry = os.environ.get("TCR_REGISTRY", "")
-    namespace = os.environ.get("TCR_NAMESPACE", "")
-    tool_name = os.environ.get("AGS_TOOL_NAME") or os.environ.get("SWE_SYNTH_SHARED_TOOL", "")
-    if not (registry and namespace and tool_name):
-        sys.exit("[x] 需要 .env 里的 TCR_REGISTRY / TCR_NAMESPACE / AGS_TOOL_NAME")
+    registry = os.environ["TCR_REGISTRY"]
+    namespace = os.environ["TCR_NAMESPACE"]
+    tool_name = os.environ.get("AGS_TOOL_NAME", "swe-rl-vpc-runner")
 
     from clients.ags import AGSClient
 
     tool = AGSClient().find_tool(tool_name)
     if not tool:
-        sys.exit(f"[x] 找不到沙箱工具 {tool_name}")
+        print(f"✗ 找不到沙箱工具 {tool_name}", file=sys.stderr)
+        return 2
     tool_id = tool["tool_id"]
 
-    tasks = [
-        json.loads(l)
-        for l in Path(args.tasks_file).read_text(encoding="utf-8").splitlines()
-        if l.strip()
-    ]
+    tasks = [json.loads(l) for l in open(ROOT / "data/tasks.jsonl") if l.strip()]
     if args.task:
         want = set(args.task)
         tasks = [t for t in tasks if t["task_id"] in want]
     elif not args.all:
-        tasks = tasks[:1]
-    if not tasks:
-        sys.exit("[x] 没有匹配的题目")
+        print("需指定 --task 或 --all", file=sys.stderr)
+        return 2
 
-    print(f"待验证 {len(tasks)} 题，并发 {args.jobs}")
+    print(f"待验证 {len(tasks)} 题，并发 {args.jobs}", flush=True)
+    t0 = time.time()
     results: list[dict] = []
     if args.jobs <= 1:
         for t in tasks:
             results.append(verify_task(t, registry, namespace, tool_id))
     else:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        with ThreadPoolExecutor(args.jobs) as ex:
             futs = {
-                pool.submit(verify_task, t, registry, namespace, tool_id): t["task_id"]
-                for t in tasks
+                ex.submit(verify_task, t, registry, namespace, tool_id): t for t in tasks
             }
             for f in as_completed(futs):
-                try:
-                    results.append(f.result())
-                except Exception as e:
-                    results.append(
-                        {"task_id": futs[f], "verdict": "exception", "error": str(e)[:400]}
-                    )
+                results.append(f.result())
 
     usable = [r for r in results if r.get("verdict") == "usable"]
-    print(f"\n{'=' * 70}\n可用 {len(usable)}/{len(results)} 题")
+    print(f"\n{'=' * 70}\n可用 {len(usable)}/{len(results)} 题，耗时 {time.time() - t0:.0f}s")
     for r in results:
         if r.get("verdict") != "usable":
-            sc = r.get("scenarios", {})
-            detail = ", ".join(
-                f"{k}={'ok' if v.get('ok') else v.get('stage', v.get('error'))}"
-                for k, v in sc.items()
-            )
-            print(f"  ✗ {r['task_id']}: {r.get('verdict')} {detail} {r.get('error', '')[:150]}")
+            print(f"  ✗ {r['task_id']}: {r.get('verdict')} {r.get('error', '')[:120]}")
 
-    Path(args.out).write_text(
-        json.dumps({r["task_id"]: r for r in results}, ensure_ascii=False, indent=2),
+    out = ROOT / args.out
+    out.write_text(
+        json.dumps(
+            {"results": results, "usable": [r["task_id"] for r in usable]},
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
-    print(f"\n结果已写入 {args.out}")
-    return 0 if len(usable) == len(results) else 1
+    print(f"\n结果已写入 {out}")
+    return 0 if usable else 1
 
 
 if __name__ == "__main__":

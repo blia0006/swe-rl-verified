@@ -1,0 +1,28 @@
+{
+  "stage": "tested",
+  "reward": {
+    "reward": 1.0,
+    "stage": "tested",
+    "apply_component": 0.0,
+    "test_component": 1.0,
+    "strict_pass": true,
+    "regression_zeroed": false,
+    "f2p_rate_str": "4/4",
+    "p2p_rate_str": "21/21",
+    "note": "strict 模式：仅严格通过得分"
+  },
+  "apply_method": "git-apply",
+  "eval_rc": 0,
+  "grade_detail": {
+    "f2p_pass": 4,
+    "f2p_total": 4,
+    "p2p_pass": 21,
+    "p2p_total": 21,
+    "resolved": true,
+    "parsed_tests": 25,
+    "f2p_missing": [],
+    "p2p_failed": []
+  },
+  "error": "",
+  "log_tail": "nceTests) ... ok\ntest_thousand_years_ago (utils_tests.test_timesince.TZAwareTimesinceTests) ... ok\ntest_both_date_objects (utils_tests.test_timesince.TimesinceTests)\nTimesince should work with both date objects (#9672) ... ok\ntest_date_objects (utils_tests.test_timesince.TimesinceTests)\nBoth timesince and timeuntil should work on date objects (#17937). ... ok\ntest_depth (utils_tests.test_timesince.TimesinceTests) ... ok\ntest_depth_invalid (utils_tests.test_timesince.TimesinceTests) ... ok\ntest_different_timezones (utils_tests.test_timesince.TimesinceTests)\nWhen using two different timezones. ... ok\ntest_display_first_unit (utils_tests.test_timesince.TimesinceTests)\nIf the two differing units aren't adjacent, only the first unit is ... ok\ntest_display_second_before_first (utils_tests.test_timesince.TimesinceTests)\nWhen the second date occurs before the first, we should always ... ok\ntest_equal_datetimes (utils_tests.test_timesince.TimesinceTests)\nequal datetimes. ... ok\ntest_ignore_microseconds_and_seconds (utils_tests.test_timesince.TimesinceTests)\nMicroseconds and seconds are ignored. ... ok\ntest_leap_year (utils_tests.test_timesince.TimesinceTests) ... ok\ntest_leap_year_new_years_eve (utils_tests.test_timesince.TimesinceTests) ... ok\ntest_months_edge (utils_tests.test_timesince.TimesinceTests) ... ok\ntest_multiple_units (utils_tests.test_timesince.TimesinceTests)\nTest multiple units. ... ok\ntest_naive_datetime_with_tzinfo_attribute (utils_tests.test_timesince.TimesinceTests) ... ok\ntest_other_units (utils_tests.test_timesince.TimesinceTests)\nTest other units. ... ok\ntest_second_before_equal_first_humanize_time_strings (utils_tests.test_timesince.TimesinceTests) ... ok\ntest_thousand_years_ago (utils_tests.test_timesince.TimesinceTests) ... ok\n\n----------------------------------------------------------------------\nRan 34 tests in 0.012s\n\nOK\nDestroying test database for alias 'default' ('file:memorydb_default?mode=memory&cache=shared')...\n+ : '>>>>> End Test Output'\n"
+}

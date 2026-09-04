@@ -1,0 +1,18 @@
+# 本项目依赖（本机编排侧 / GPU 节点编排侧通用）
+#
+# ⚠️ swebench 必须**锁死版本**：判据（test_cmd 表、日志 parser）直接取自该包，
+# 版本不同判分口径就不同。实测 5.0.2 重构了包结构（constants/python.py 被移除），
+# 与 3.0.17 不兼容；若本机与节点装了不同版本，会出现"本机判满分、节点判 0 分"
+# 这类极难定位的问题。
+swebench==3.0.17
+
+# 沙箱 SDK（AGS 的 e2b 兼容接口）
+e2b-code-interpreter
+
+# 腾讯云：沙箱工具管理（AGS）、COS（tracing 传递通道）
+tencentcloud-sdk-python-ags
+tencentcloud-sdk-python-common
+cos-python-sdk-v5
+
+# 配置读取（凭证只从 .env 读，不落代码）
+python-dotenv

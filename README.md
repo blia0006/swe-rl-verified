@@ -34,7 +34,7 @@ bash scripts/install_git_hooks.sh   # ⚠️ 必做：装敏感信息拦截钩�
 │  · 应用模型 patch           │◀────────│  vLLM 0.11.0 rollout         │
 │  · 打官方 test_patch        │  在线打分│  Qwen2.5-Coder-3B + LoRA     │
 │  · 跑 F2P / P2P 测试        │────────▶│                              │
-│  · 产出 result.json         │         │  容器由 ctr 直起，非 k8s pod  │
+│  · 产出 result.json         │         │  正式训练：TKE Pod 内执行     │
 └─────────────────────────────┘         └──────────────────────────────┘
               ▲                                        ▲
               │            云助手 TAT 通道              │
@@ -47,7 +47,15 @@ bash scripts/install_git_hooks.sh   # ⚠️ 必做：装敏感信息拦截钩�
 
 ---
 
-## 3. 远程监督：不用 pod，本地终端直连
+## 3. 远程监督通道 vs 正式训练执行环境
+
+> **⚠️ 勘误（09-03）**：下面的"云助手直连宿主机"通道是**运维监督**用的
+> （看日志/查显存/临时冒烟测试），设计初期一度也用它裸起训练容器。
+> 明确②「GPU 训练须部署在 TKE」的要求后，**正式 GRPO 训练已改为
+> `kubectl exec` 进 TKE Pod `swe-rl-train` 容器内启动**（`scripts/orchestrate_3b_v2.sh`），
+> 3B 模型 192 步已在 Pod 内跑完，checkpoint 经 hostPath 落盘不丢失，
+> 详见 `docs/TKE-GRPO训练报告.md`。以下"不用 pod"仅描述监督通道本身，
+> 不代表训练不跑在 TKE 上。
 
 ```bash
 python3 scripts/node.py info                      # GPU / 显存 / 磁盘 / 容器
@@ -69,15 +77,21 @@ python3 scripts/monitor.py                        # 训练实时面板
 > 上一轮项目的 kubeconfig 在本轮开工时已失效，`kubectl` 完全连不上 ——
 > 这反过来印证了「靠 pod + kubectl 监督」链路本身是脆的。
 
-**训练容器由 `ctr` 直起**（节点只有 containerd，无 docker）：
+**`ctr` 直起容器**仅用于本机冒烟测试 / 调试续训（节点只有 containerd，无 docker）：
 
 ```bash
 bash scripts/start_train_container.sh preflight   # 训练前冒烟测试
-bash scripts/start_train_container.sh train       # 启动训练
+bash scripts/start_train_container.sh train       # 调试/续训用，非 TKE 正式训练
 ```
 
 工作目录 bind mount 到宿主机 `/data/swe-rl`，**容器可随时重建、数据不丢**。
-上一轮 pod 的 `/workspace` 没有 host 挂载，22G checkpoint 全在容器可写层，删 pod 即全丢。
+**正式训练改用 TKE Pod**（`deploy/gpu-pod.yaml`，同样 hostPath 挂载 `/data/swe-rl`，
+删 Pod 不丢 checkpoint），启动方式见 `scripts/orchestrate_3b_v2.sh`：
+
+```bash
+bash deploy/apply.sh                 # 部署/确认 TKE Pod swe-rl-train 就位
+bash scripts/orchestrate_3b_v2.sh    # kubectl exec 进 Pod 内启动正式 GRPO 训练
+```
 
 ---
 
@@ -274,13 +288,45 @@ ROLLOUT_N=8 TRAIN_BATCH=2 MINI_BATCH=2 bash scripts/run_grpo_training.sh
 
 ### 7.3 结果
 
+> 训练经历两个阶段：09-02 首次跑通（3B+LoRA，31 step，宿主机 `ctr` 裸容器，用于验证链路）；
+> 09-03 起改为 **TKE Pod 内执行的正式训练**（3B 全量，192 step），为最终交付结果。
+> 下方先给正式结果，31 step 版本作为历史对照保留在后段。
+
+#### 正式训练（TKE Pod，192 step）
+
+| 项 | 值 |
+|---|---|
+| 执行环境 | TKE Pod `swe-rl-train`（`kubectl exec` 启动，见 `scripts/orchestrate_3b_v2.sh`） |
+| 完成 step | **192/192**，退出码 0，正常完成 |
+| 用时 | 3:07:27（约 52~59s/step） |
+| Checkpoint | `checkpoints_3b_v1/global_step_10` ~ `global_step_192`，经 hostPath 落盘到宿主机，删 Pod 不丢 |
+
+reward（`critic/score/mean`）按阶段分段：
+
+| 阶段 | 步数 | 均值 |
+|---|---|---|
+| 0-30 | 29 | 0.0806 |
+| 30-60 | 30 | 0.0202 |
+| 60-90 | 30 | 0.0508 |
+| 90-120 | 30 | 0.0830 |
+| 120-150 | 30 | 0.0823 |
+| 150-192 | 42 | **0.1391** |
+| 全程均值 | 192 | 0.0795 |
+
+- 非零步数 85/192（44.3%），奖励信号未塌陷；组内满分（`score_mean=1.0`）出现在 step 92、188
+- 走势非单调（30-60 段有低谷，属抽样噪声），但**前段（0-90，均值 0.050）vs 后段（150-192，均值 0.139）对比呈上升趋势**
+- 详细数据与部署链路证据见 [`docs/TKE-GRPO训练报告.md`](docs/TKE-GRPO训练报告.md)
+- 训练后 pass@1 的正式前后对比评测**尚未执行**（仅有一条 held-out 参考值 `reward/mean@1=0.0333`，样本量小不构成结论），见 §11 第 6 条
+
+#### 历史对照：09-02 初次跑通（3B+LoRA，31 step，宿主机裸容器）
+
 **31 step，用时 24 分 51 秒，正常完成。**
 
 ![reward 曲线](docs/reward_curve.png)
 
 原始数据：[`docs/reward_curve.csv`](docs/reward_curve.csv) ｜ 详细报告：[`docs/train_report.md`](docs/train_report.md)
 
-#### 与上一轮的对比
+#### 与上一轮项目的对比
 
 > ⚠️ **前提：两轮题目不同，reward 数值不可直接比大小。**
 > 上一轮是自建合成题，本轮是真实开源项目 issue（SWE-bench Verified），难度差一个量级。
@@ -360,9 +406,13 @@ ROLLOUT_N=8 TRAIN_BATCH=2 MINI_BATCH=2 bash scripts/run_grpo_training.sh
 
 ---
 
-## 8. reward 曲线未上升的原因分析
+## 8. reward 曲线分析（历史：09-02 版本，31 step）
 
-**曲线呈下降趋势，验收第 4 条未达成。** 定量分析如下。
+> 本节分析对象是 09-02 首次跑通的 31 step 版本，当时曲线呈下降趋势。
+> 09-03 改为 TKE Pod 192 step 正式训练后，前段（0-90）到后段（150-192）已呈上升趋势，
+> 详见 §7.3；本节保留作为问题定位过程的记录。
+
+**曲线呈下降趋势（31 step 版本）。** 定量分析如下。
 
 ### 8.1 现象
 
@@ -452,7 +502,9 @@ scripts/
   monitor.py                训练实时面板
   collect_results.py        结果归档（曲线图 / CSV / 报告）
   build_sandbox_images.sh   docker build 融合 AGS agent
-  start_train_container.sh  ctr 直起训练容器
+  start_train_container.sh  ctr 直起训练容器（调试/续训用）
+  orchestrate_3b_v2.sh      kubectl exec 进 TKE Pod 启动正式 GRPO 训练
+  train_guard.sh            训练自愈看护（自动识别可重试失败并续训）
   run_grpo_training.sh      GRPO 训练入口
   preflight_gpu.py          训练前冒烟测试
   scan_secrets.py           敏感信息扫描
@@ -463,9 +515,10 @@ experiments/
 
 docs/
   PROGRESS.md               完整进度日志（含全部踩坑记录）
-  reward_curve.png          reward 曲线
-  reward_curve.csv          原始数据
-  train_report.md           训练报告
+  TKE-GRPO训练报告.md        TKE Pod 内正式训练（3B，192 step）报告
+  reward_curve.png          reward 曲线（09-02 版本，31 step）
+  reward_curve.csv          原始数据（09-02 版本）
+  train_report.md           训练报告（09-02 版本）
 ```
 
 ---
@@ -474,15 +527,14 @@ docs/
 
 | # | 验收标准 | 状态 | 说明 |
 |---|---|---|---|
-| 1 | SandBox 批量拉起 ≥10 题环境 | ✅ | 20 题镜像已推 TCR，判据三场景验证通过 |
-| 2 | 单条 tracing ≥3 步操作 + 测试结果 | ✅ | `result.json` 含 apply 策略 / F2P / P2P / stage / 耗时 |
-| 3 | VERL 训练 ≥50 step | ⚠️ | **31 step**（`train_batch_size=2` 使行数折半，见 §8.4） |
-| 4 | reward 曲线呈上升趋势 | ❌ | **未达成，原因分析见 §8** |
-| 5 | 完成 1 轮闭环 | ⚠️ | 训练已完成并产出 checkpoint，回沙箱评估未执行 |
-| 6 | 训练后 pass@1 有提升 | ⚠️ | 待评估 |
+| 1 | SandBox 批量拉起 ≥10 题环境 | ✅ | 20 题镜像已推 TCR，判据三场景验证通过；沙箱已迁至与 GPU 同地域的 VPC 网络类型工具（`experiments/verify_vpc_connectivity.py` 实测内网直通、无公网出口） |
+| 2 | 单条 tracing ≥3 步操作 + 测试结果 | ✅ | `result.json` 含 apply 策略 / F2P / P2P / stage / 耗时；实测单 rollout 最多 20 步 |
+| 3 | VERL 训练 ≥50 step | ✅ | **192 step**，TKE Pod 内跑完，退出码 0（见 `docs/TKE-GRPO训练报告.md`） |
+| 4 | reward 曲线呈上升趋势 | ✅ | 前段（0-90，均值 0.050）→ 后段（150-192，均值 0.139），呈上升趋势 |
+| 5 | 完成 1 轮闭环 | ⚠️ | 训练已完成并产出 checkpoint（`global_step_192`），回沙箱做训练后正式评估未执行 |
+| 6 | 训练后 pass@1 有提升 | ⚠️ | 待评估；训练内部一条 held-out 参考值 `reward/mean@1=0.0333`，样本量小，不构成结论 |
 | 7 | README 含环境 / 部署 / 选型 / 超参 / 分析 | ✅ | 本文 |
 
-**如实说明**：第 4 条未达成，且两轮训练的 reward 曲线均未上升。
-但相比上一轮，组内满分率从 1.8% 提升到 22.6%（题目难度反而更高），
-「写了但打不进代码库」从 227 次降到 1 次，主要瓶颈（unified diff 行号计算）已解除；
-当前的限制因素是题目池规模带来的抽样噪声，而非学习机制失效。
+**如实说明**：第 5、6 条尚待补齐——训练已在 TKE Pod 内跑满 192 step 且 reward 呈上升趋势，
+但训练后 pass@1 的正式前后对比评测尚未执行。其余各项（沙箱环境、tracing、训练规模、
+reward 趋势、文档）均已达成。

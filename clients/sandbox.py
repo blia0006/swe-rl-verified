@@ -14,6 +14,17 @@ AGS 首次使用某个新推送的镜像时，需要在平台侧做一次「镜�
 每次间隔 ~80s）。
 
 因此把"预热等待"固化在这里，避免任何调用方再把它当成错误。
+
+## 第二个坑：新实例的 DNS 传播延迟
+
+`Sandbox.connect(instance_id)` 走的是 `<instance>-49999.<region>.tencentags.com`
+这个**按实例动态生成的域名**。实例刚创建时，该域名尚未在公网 DNS 生效，报
+
+    ConnectError: [Errno 8] nodename nor servname provided, or not known
+
+它看起来像"沙箱起失败了"，实际实例已 RUNNING，只是域名还没传播开。
+实测同一份代码连续两次运行、一次成功一次失败，正是这个原因。
+`connect_with_retry` 专门吸收这段延迟。
 """
 
 from __future__ import annotations
@@ -27,6 +38,56 @@ _WARMUP_MARKERS = (
     "ImagePrepare",
     "image is preparing",
 )
+
+# 这些错误表示「实例域名尚未在 DNS 生效」，等待后重试即可
+_DNS_MARKERS = (
+    "nodename nor servname",
+    "Name or service not known",
+    "Temporary failure in name resolution",
+    "getaddrinfo",
+    "ConnectError",
+)
+
+
+def is_dns_pending(err: BaseException) -> bool:
+    msg = str(err)
+    return any(m in msg for m in _DNS_MARKERS)
+
+
+def connect_with_retry(
+    instance_id: str,
+    *,
+    max_wait_s: float = 120,
+    poll_s: float = 5,
+    verbose: bool = False,
+) -> Any:
+    """连接沙箱实例，吸收 DNS 传播延迟。
+
+    只对 DNS 类错误重试；其他错误（如鉴权失败、实例不存在）立即抛出，
+    避免把真故障拖成 2 分钟超时。
+    """
+    from e2b_code_interpreter import Sandbox
+
+    deadline = time.time() + max_wait_s
+    attempt = 0
+    last: BaseException | None = None
+    while time.time() < deadline:
+        attempt += 1
+        try:
+            return Sandbox.connect(instance_id)
+        except Exception as e:  # noqa: BLE001 —— 需按错误内容分流
+            last = e
+            if not is_dns_pending(e):
+                raise
+            if verbose:
+                print(
+                    f"      实例域名 DNS 未生效（第 {attempt} 次），"
+                    f"剩余 {int(deadline - time.time())}s",
+                    flush=True,
+                )
+            time.sleep(poll_s)
+    assert last is not None
+    raise TimeoutError(f"实例 {instance_id} 域名 {max_wait_s}s 内未生效：{last}")
 
 
 def is_warming_up(err: BaseException) -> bool:

@@ -51,17 +51,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from pipeline.edit_format import model_output_to_patch  # noqa: E402
-from pipeline.reward import (  # noqa: E402
-    Stage,
-    compute_reward,
-    outcome_from_json,
-)
+from pipeline.reward import Stage, compute_reward  # noqa: E402
 
-VERIFY_SCRIPT = ROOT / "sandbox_agent" / "swebench_verify.py"
-
-# 判据脚本必须用**系统** python3.10 跑：题目的 conda 环境可能老至 py3.6。
-# 必须写绝对路径 —— 镜像 PATH 里 conda 在前，裸写 python3 会解析错解释器。
-SYS_PY = "/usr/bin/python3"
+# 注：判据不再由注入沙箱的脚本负责，改由 pipeline/sandbox_eval 在训练侧
+# 按 (repo, version) 生成官方 eval 脚本、并用官方 parser 解析日志。
+# 因此这里不再需要 VERIFY_SCRIPT / SYS_PY / outcome_from_json。
+# 详见 _score_in_sandbox 的说明。
 
 _POOL_LOCK = threading.Lock()
 _CACHE_LOCK = threading.Lock()
@@ -81,10 +76,9 @@ def _env(key, default):
 TASKS_FILE = _env("TASKS_FILE", str(ROOT / "data" / "tasks.jsonl"))
 FILE_CONTENTS_FILE = _env("FILE_CONTENTS_FILE", str(ROOT / "data" / "file_contents.json"))
 DEBUG_LOG = _env("REWARD_DEBUG_LOG", "")
-STRICT_APPLY = _env("REWARD_STRICT_APPLY", "0") == "1"
 STRICT_SCORE = _env("REWARD_STRICT_SCORE", "0") == "1"   # 评测口径：只认严格通过
 IMAGE_TAG = _env("SANDBOX_IMAGE_TAG", "sbx")
-VERIFY_TIMEOUT = int(_env("VERIFY_TIMEOUT", "900"))
+VERIFY_TIMEOUT = int(_env("VERIFY_TIMEOUT", "1800"))     # 含 install 的官方脚本更慢
 
 
 def _load_tasks():
@@ -137,14 +131,17 @@ def _sbx_run(sbx, cmd, timeout=900):
 
 
 def _get_instance(task_id):
-    """取得该题的常驻沙箱实例（没有就创建并完成一次性初始化）。"""
+    """取得该题的常驻沙箱实例（没有就创建）。
+
+    实例在整个训练期常驻并复用：沙箱启动约 11s，而训练每步要判分
+    ROLLOUT_N 次，每次都新建实例的话开销无法接受。
+    """
     with _POOL_LOCK:
         if task_id in _instances:
             return _instances[task_id]
 
     from clients.ags import AGSClient
-    from clients.sandbox import start_instance_with_warmup
-    from e2b_code_interpreter import Sandbox
+    from clients.sandbox import connect_with_retry, start_instance_with_warmup
 
     task = _load_tasks()[task_id]
     registry = os.environ["TCR_REGISTRY"]
@@ -157,21 +154,15 @@ def _get_instance(task_id):
         os.environ.get("AGS_TOOL_NAME") or os.environ["SWE_SYNTH_SHARED_TOOL"]
     )
     inst, _eff = start_instance_with_warmup(
-        ags, tool["tool_id"], image, cpu="2", memory="4Gi"
+        ags, tool["tool_id"], image, cpu="2", memory="4Gi", verbose=False
     )
-    sbx = Sandbox.connect(inst)
+    # 必须走带重试的连接：实例刚创建时其动态域名尚未在 DNS 生效，
+    # 裸 Sandbox.connect 会报 "nodename nor servname provided"（详见 clients/sandbox.py）
+    sbx = connect_with_retry(inst)
 
-    # 一次性注入：判据脚本 + 题目规格
     _sbx_run(sbx, "mkdir -p /task", 60)
-    spec = {
-        "task_id": task_id,
-        "fail_to_pass": task["fail_to_pass"],
-        "pass_to_pass": task["pass_to_pass"],
-        "test_patch": task["test_patch"],
-    }
-    # 必须 user="root"：官方镜像没有名为 `user` 的账号
-    sbx.files.write("/task/swebench_verify.py", VERIFY_SCRIPT.read_text(encoding="utf-8"), user="root")
-    sbx.files.write("/task/spec.json", json.dumps(spec, ensure_ascii=False), user="root")
+    # 判据脚本不再注入沙箱：改由 pipeline/sandbox_eval 在**训练侧**生成官方
+    # eval 脚本并解析日志（见下方 _score_in_sandbox 的说明）
 
     with _POOL_LOCK:
         _instances[task_id] = (inst, sbx)
@@ -197,39 +188,51 @@ def release_all():
 # ------------------------------------------------------------------ 打分
 
 def _score_in_sandbox(task_id, patch_text):
-    """把 patch 送进沙箱打分，返回 (RewardBreakdown, 原始 result)。"""
+    """把 patch 送进沙箱打分，返回 (RewardBreakdown, 判分细节)。
+
+    ## 为什么改走 pipeline/sandbox_eval（本轮的关键修正）
+
+    旧实现把 `sandbox_agent/swebench_verify.py` 注入沙箱，由它在容器内
+    统一用 `pytest -rA <单个 test id>` 跑测试。这对 **9/20 题完全无效**：
+
+    | repo | 官方 test_cmd | pytest 单 id 的结果 |
+    |---|---|---|
+    | django/django | `./tests/runtests.py --settings=test_sqlite` | 测试 id 形如 `test_x (mod.Cls)`，pytest 不认 |
+    | sphinx-doc/sphinx | `tox --current-env -epy39 --` | 绕过 tox 缺插件与 `-rA`，无 PASSED 行可解析 |
+    | sympy/sympy | `bin/test -C --verbose` | sympy 自有 runner，pytest 收集不全 |
+
+    结果是这些题**无论模型答对答错都判 0 分**，组内无差异 → advantage 恒 0 →
+    梯度为 0。这是上一轮"14/31 步 score 全 0"的地基性根因，比抽样方差的
+    解释更靠前。
+
+    新实现改由**训练侧**按 `(repo, version)` 查官方规格表生成 eval 脚本，
+    沙箱只负责执行与回传日志，解析与判定都在训练侧做。好处：
+      · 判据与官方 harness 逐字对齐，20/20 题 golden 均判满分（已实测）
+      · 改判据规则不需要重建 20 个镜像
+      · 与判据验证、tracing 采集**共用同一段代码**，不会出现"验证能过、
+        训练拿 0 分"这类无法定位的问题
+    """
+    from pipeline.sandbox_eval import run_eval
+
     _inst, sbx = _get_instance(task_id)
+    task = _load_tasks()[task_id]
 
-    sbx.files.write("/task/model.diff", patch_text, user="root")
-    cmd = (
-        "%s /task/swebench_verify.py --spec /task/spec.json "
-        "--patch /task/model.diff --out /task/result.json --restore%s"
-        % (SYS_PY, " --strict-apply" if STRICT_APPLY else "")
-    )
-    code, out = _sbx_run(sbx, cmd, VERIFY_TIMEOUT)
-
-    try:
-        payload = sbx.files.read("/task/result.json", user="root")
-        result = json.loads(payload)
-    except Exception as e:
-        # 读不到结果 = 沙箱侧真异常（与"答错"区分开，避免像上一轮那样归因失真）
-        return (
-            compute_reward(Stage.APPLY_FAILED),
-            {"stage": "sandbox_error", "error": str(e)[:300], "stdout_tail": out[-500:]},
+    ev = run_eval(sbx, task, patch_text, timeout=VERIFY_TIMEOUT, strict=STRICT_SCORE)
+    detail = {
+        "stage": ev.stage.value,
+        "apply_method": ev.apply_method,
+        "eval_rc": ev.eval_rc,
+        "error": ev.error[:300],
+    }
+    if ev.grade_detail:
+        detail.update(
+            f2p_pass=ev.grade_detail.get("f2p_pass"),
+            f2p_total=ev.grade_detail.get("f2p_total"),
+            p2p_pass=ev.grade_detail.get("p2p_pass"),
+            p2p_total=ev.grade_detail.get("p2p_total"),
+            resolved=ev.grade_detail.get("resolved"),
         )
-
-    stage_name = result.get("stage", "")
-    if stage_name == "tested":
-        bd = compute_reward(Stage.TESTED, outcome_from_json(result), strict=STRICT_SCORE)
-    elif stage_name == "collect_error":
-        bd = compute_reward(Stage.COLLECT_ERROR, strict=STRICT_SCORE)
-    elif stage_name == "apply_failed":
-        bd = compute_reward(Stage.APPLY_FAILED)
-    else:
-        # test_patch_failed / restore_failed / no_tests：属基础设施问题，
-        # 不该记在模型头上，但也无法给分，记 0 并在日志里标明
-        bd = compute_reward(Stage.APPLY_FAILED)
-    return bd, result
+    return ev.reward, detail
 
 
 def compute_score(data_source, solution_str, ground_truth, extra_info=None):
@@ -279,8 +282,10 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
         p2p=bd.p2p_rate_str,
         strict_pass=bd.strict_pass,
         regression_zeroed=bd.regression_zeroed,
-        apply_strategy=result.get("apply_strategy", ""),
+        apply_strategy=result.get("apply_method", ""),
         verify_stage=result.get("stage", ""),
+        resolved=result.get("resolved"),
+        eval_error=result.get("error", ""),
         elapsed_s=round(time.time() - t0, 2),
     )
     _log(record)

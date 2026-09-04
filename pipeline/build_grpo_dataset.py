@@ -115,6 +115,13 @@ def main():
     ap.add_argument("--max-file-lines", type=int, default=400,
                     help="单文件在 prompt 中最多展示多少行")
     ap.add_argument("--preview", action="store_true", help="打印一条完整 prompt 后退出")
+    ap.add_argument(
+        "--split-key",
+        default="train",
+        choices=["train", "eval"],
+        help="从 split.json 取哪一部分题目。用 eval 可单独构建"
+             "真正独立于训练集的held-out验证 parquet（供 data.val_files 用）",
+    )
     args = ap.parse_args()
 
     tasks = {
@@ -125,20 +132,21 @@ def main():
     split = json.loads(Path(args.split_file).read_text(encoding="utf-8"))
     contents_all = json.loads(Path(args.contents_file).read_text(encoding="utf-8"))
 
-    train_ids = split["train"]
-    missing = [t for t in train_ids if not contents_all.get(t)]
+    target_ids = split[args.split_key]
+    missing = [t for t in target_ids if not contents_all.get(t)]
     if missing:
         print("[!] 以下题目缺文件内容，将被跳过（先跑 extract_file_contents.py）：")
         for t in missing:
             print("    " + t)
-    usable = [t for t in train_ids if contents_all.get(t)]
+    usable = [t for t in target_ids if contents_all.get(t)]
     if not usable:
         sys.exit("[x] 没有可用题目")
 
     # 防泄漏：训练集绝不能碰评测集（上一轮修过的 bug，这里硬校验）
-    overlap = set(usable) & set(split["eval"])
+    other_key = "eval" if args.split_key == "train" else "train"
+    overlap = set(usable) & set(split[other_key])
     if overlap:
-        sys.exit("[x] 训练集与评测集重叠：%s" % overlap)
+        sys.exit("[x] %s 集与 %s 集重叠：%s" % (args.split_key, other_key, overlap))
 
     if args.preview:
         tid = usable[0]
