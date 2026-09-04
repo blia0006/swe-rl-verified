@@ -315,6 +315,11 @@ reward（`critic/score/mean`）按阶段分段：
 
 - 非零步数 85/192（44.3%），奖励信号未塌陷；组内满分（`score_mean=1.0`）出现在 step 92、188
 - 走势非单调（30-60 段有低谷，属抽样噪声），但**前段（0-90，均值 0.050）vs 后段（150-192，均值 0.139）对比呈上升趋势**
+
+![reward 曲线（正式训练，192 step）](docs/reward_curve_192.png)
+
+原始数据：[`docs/reward_curve_192.csv`](docs/reward_curve_192.csv)（从 `logs/train_pod_3b.log` 逐行提取 `critic/score/mean`，192 条，一一对应 global_step）
+
 - 详细数据与部署链路证据见 [`docs/TKE-GRPO训练报告.md`](docs/TKE-GRPO训练报告.md)
 
 #### 7.4 训练后正式评测：pass@1 前后对比（闭环最后一环）
@@ -341,9 +346,9 @@ reward（`critic/score/mean`）按阶段分段：
 
 #### 历史对照：09-02 初次跑通（3B+LoRA，31 step，宿主机裸容器）
 
-**31 step，用时 24 分 51 秒，正常完成。**
+**31 step，用时 24 分 51 秒，正常完成。**（该图为链路验证阶段结果，非最终交付版本，最终版见上方 §7.3 正式训练小节的 `reward_curve_192.png`）
 
-![reward 曲线](docs/reward_curve.png)
+![reward 曲线（09-02 首轮试跑）](docs/reward_curve.png)
 
 原始数据：[`docs/reward_curve.csv`](docs/reward_curve.csv) ｜ 详细报告：[`docs/train_report.md`](docs/train_report.md)
 
@@ -537,8 +542,10 @@ experiments/
 docs/
   PROGRESS.md               完整进度日志（含全部踩坑记录）
   TKE-GRPO训练报告.md        TKE Pod 内正式训练（3B，192 step）报告
-  reward_curve.png          reward 曲线（09-02 版本，31 step）
-  reward_curve.csv          原始数据（09-02 版本）
+  reward_curve_192.png      reward 曲线（正式训练，192 step，最终交付版本）
+  reward_curve_192.csv      原始数据（正式训练，192 step）
+  reward_curve.png          reward 曲线（09-02 首轮试跑，31 step，历史对照）
+  reward_curve.csv          原始数据（09-02 首轮试跑）
   train_report.md           训练报告（09-02 版本）
 ```
 
@@ -551,7 +558,7 @@ docs/
 | 1 | SandBox 批量拉起 ≥10 题环境 | ✅ | 20 题镜像已推 TCR，判据三场景验证通过；沙箱已迁至与 GPU 同地域的 VPC 网络类型工具（`experiments/verify_vpc_connectivity.py` 实测内网直通、无公网出口） |
 | 2 | 单条 tracing ≥3 步操作 + 测试结果 | ✅ | `result.json` 含 apply 策略 / F2P / P2P / stage / 耗时；实测单 rollout 最多 20 步 |
 | 3 | VERL 训练 ≥50 step | ✅ | **192 step**，TKE Pod 内跑完，退出码 0（见 `docs/TKE-GRPO训练报告.md`） |
-| 4 | reward 曲线呈上升趋势 | ✅ | 前段（0-90，均值 0.050）→ 后段（150-192，均值 0.139），呈上升趋势 |
+| 4 | reward 曲线呈上升趋势 | ✅ | 前段（0-90，均值 0.050）→ 后段（150-192，均值 0.139），呈上升趋势；matplotlib 图表见 [`docs/reward_curve_192.png`](docs/reward_curve_192.png) |
 | 5 | 完成 1 轮闭环 | ✅ | 训练（TKE Pod 192 step）→ checkpoint 合并 → vLLM serve → 沙箱跑 10 道 held-out 题评测，全链路实测跑通（`scripts/eval_before_after.sh`） |
 | 6 | 训练后 pass@1 有提升 | ✅ | **训练前 1/10（10%）→ 训练后 3/10（30%）**，评测集 10 题全部通过沙箱环境校验，详见 §7.4 |
 | 7 | README 含环境 / 部署 / 选型 / 超参 / 分析 | ✅ | 本文 |
